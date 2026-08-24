@@ -1,60 +1,76 @@
 package hu.elte.bkktransit.entity;
 
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+
+/**
+ * One row of BKK's GTFS stops.txt — a physical stop, platform, or station.
+ * stop_id is BKK's own stable identifier, so we use it directly as our
+ * primary key instead of generating a surrogate one.
+ */
+@Entity
+@Table(name = "stops")
 public class Stop {
-    private Long id;
-    private String name;
-    private double latitude;
-    private double longitude;
 
-    public Stop() {
+    @Id
+    private String stopId;
+
+    private String stopName;
+    private Double stopLat;
+    private Double stopLon;
+    private String stopCode;
+    private Integer locationType;
+    private String parentStation;
+    private Integer wheelchairBoarding;
+
+    // JPA requires a no-arg constructor - it builds entities via reflection,
+    // not by calling your constructors directly.
+    protected Stop() {
     }
 
-    public Stop(Long id, String name, double latitude, double longitude) {
-        this.id = id;
-        this.name = name;
-        this.latitude = latitude;
-        this.longitude = longitude;
+    public Stop(String stopId, String stopName, Double stopLat, Double stopLon,
+                String stopCode, Integer locationType, String parentStation,
+                Integer wheelchairBoarding) {
+        this.stopId = stopId;
+        this.stopName = stopName;
+        this.stopLat = stopLat;
+        this.stopLon = stopLon;
+        this.stopCode = stopCode;
+        this.locationType = locationType;
+        this.parentStation = parentStation;
+        this.wheelchairBoarding = wheelchairBoarding;
     }
 
-    public Long getId() {
-        return id;
+    public String getStopId() {
+        return stopId;
     }
 
-    public void setId(Long id) {
-        this.id = id;
+    public String getStopName() {
+        return stopName;
     }
 
-    public String getName() {
-        return name;
+    public Double getStopLat() {
+        return stopLat;
     }
 
-    public void setName(String name) {
-        this.name = name;
+    public Double getStopLon() {
+        return stopLon;
     }
 
-    public double getLatitude() {
-        return latitude;
+    public String getStopCode() {
+        return stopCode;
     }
 
-    public void setLatitude(double latitude) {
-        this.latitude = latitude;
+    public Integer getLocationType() {
+        return locationType;
     }
 
-    public double getLongitude() {
-        return longitude;
+    public String getParentStation() {
+        return parentStation;
     }
 
-    public void setLongitude(double longitude) {
-        this.longitude = longitude;
-    }
-
-    @Override
-    public String toString() {
-        return "Stop{" +
-                "id=" + id +
-                ", name='" + name + '\'' +
-                ", latitude=" + latitude +
-                ", longitude=" + longitude +
-                '}';
+    public Integer getWheelchairBoarding() {
+        return wheelchairBoarding;
     }
 }
