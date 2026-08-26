@@ -35,3 +35,7 @@ build/
 ### Data / logs (regenerate from BKK OpenData, don't commit) ###
 gtfs-data/
 hs_err_pid*.log
+
+### Postman (local workspace sync, not project source) ###
+.postman/
+postman/

@@ -1,0 +1,8 @@
+/* Leaflet needs the map container to have an explicit height - "height: 100%"
+   only works if every ancestor (html, body) also has a defined height, so we
+   set all three rather than just #map. */
+html, body, #map {
+    height: 100%;
+    margin: 0;
+    padding: 0;
+}

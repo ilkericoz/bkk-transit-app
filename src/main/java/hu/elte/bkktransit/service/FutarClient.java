@@ -18,8 +18,29 @@ import java.util.List;
 @Service
 public class FutarClient {
 
+    // How long a cached response is served before we call BKK again. Pegged
+    // to the frontend's own poll interval (see app.js POLL_INTERVAL_MS): if
+    // several browser tabs are open and polling every 10s, this collapses
+    // them to roughly one upstream BKK call per 10s instead of one per tab -
+    // otherwise every viewer's poll would hit BKK's live API directly and
+    // the load would scale with viewer count, not with how often the
+    // underlying data actually changes.
+    private static final long CACHE_TTL_MILLIS = 10_000;
+
     private final RestClient restClient;
     private final String apiKey;
+
+    // Single-slot cache: holds only the most recent (query, result) pair,
+    // not a full keyed cache of every distinct (lat, lon, radius) ever
+    // requested. Fine as long as the frontend always queries the same fixed
+    // area (true today - see CENTER in app.js); if this ever needs to serve
+    // many different viewports at once, this would need to become a bounded
+    // keyed cache (e.g. Caffeine) instead, so entries for viewports nobody
+    // is looking at anymore get evicted.
+    private volatile CachedVehicles cache;
+
+    private record CachedVehicles(String queryKey, long expiresAtMillis, List<VehiclePosition> vehicles) {
+    }
 
     // Built directly via RestClient.builder() rather than injecting a
     // RestClient.Builder bean - Boot 4 split RestClient auto-configuration
@@ -35,12 +56,37 @@ public class FutarClient {
 
     /**
      * Every vehicle BKK is currently tracking within radiusMeters of (lat, lon).
+     * Serves a cached result when one exists for this exact query and hasn't
+     * expired yet, rather than calling BKK on every single request - see
+     * CACHE_TTL_MILLIS.
+     *
+     * Synchronized so two requests racing right as the cache expires don't
+     * both slip through and double up the upstream call - vehicle counts are
+     * small enough (a few hundred, at most) that holding the lock for the
+     * duration of one BKK call is not worth optimizing away here.
+     */
+    public synchronized List<VehiclePosition> vehiclesNear(double lat, double lon, int radiusMeters) {
+        String queryKey = lat + "," + lon + "," + radiusMeters;
+        CachedVehicles current = cache;
+        if (current != null && current.queryKey().equals(queryKey)
+                && System.currentTimeMillis() < current.expiresAtMillis()) {
+            return current.vehicles();
+        }
+
+        List<VehiclePosition> fresh = fetchFromBkk(lat, lon, radiusMeters);
+        cache = new CachedVehicles(queryKey, System.currentTimeMillis() + CACHE_TTL_MILLIS, fresh);
+        return fresh;
+    }
+
+    /**
+     * The actual BKK call - pulled out of vehiclesNear() so the caching logic
+     * above and the "talk to BKK" logic below aren't tangled together.
      * BKK's response has a lot of fields we don't need (capacity, congestion,
      * icon styling, ...) - rather than write DTO classes to model the whole
      * thing just to throw most of it away, we read it as a generic JsonNode
      * tree and pull out only what VehiclePosition needs.
      */
-    public List<VehiclePosition> vehiclesNear(double lat, double lon, int radiusMeters) {
+    private List<VehiclePosition> fetchFromBkk(double lat, double lon, int radiusMeters) {
         JsonNode root = restClient.get()
                 .uri(uriBuilder -> uriBuilder
                         .path("/vehicles-for-location.json")

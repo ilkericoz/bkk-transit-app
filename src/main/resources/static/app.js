@@ -1,0 +1,100 @@
+// Deák Ferenc tér, central Budapest - a fixed center for stage 3 rather than
+// recomputing lat/lon/radius from the map's current pan/zoom. Simpler, and
+// good enough to demo "live vehicles across the city" convincingly.
+const CENTER = [47.4979, 19.0402];
+const RADIUS_METERS = 6000;
+// 10s, not 5s: checked BKK's actual data - most vehicles only report a new
+// GPS position every 10-20+ seconds, so polling faster than that just
+// re-fetches data that hasn't changed yet.
+const POLL_INTERVAL_MS = 10000;
+
+// BKK's real-time feed returns vehicleRouteType as a descriptive string, NOT
+// the numeric GTFS route_type code stage 1's static feed uses (e.g. "TRAM",
+// not "0") - found by actually calling the live endpoint rather than
+// assuming the two feeds share an encoding. Map each to a distinct color so
+// vehicle types are visually distinguishable on the map at a glance.
+const ROUTE_TYPE_COLORS = {
+    TRAM: "#e67e22",
+    SUBWAY: "#2980b9",
+    RAIL: "#8e44ad",
+    SUBURBAN_RAILWAY: "#8e44ad",
+    BUS: "#27ae60",
+    TROLLEYBUS: "#16a085",
+    COACH: "#27ae60",
+    FERRY: "#2c3e50",
+};
+const DEFAULT_COLOR = "#7f8c8d";
+
+function colorFor(routeType) {
+    return ROUTE_TYPE_COLORS[routeType] ?? DEFAULT_COLOR;
+}
+
+const map = L.map("map").setView(CENTER, 13);
+
+L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 19,
+    attribution: "&copy; OpenStreetMap contributors",
+}).addTo(map);
+
+// Keyed by vehicleId so a repeat sighting of the same vehicle moves its
+// existing marker instead of stacking a new one on top - the alternative
+// (clear all markers, re-add every poll) would make the map flicker every
+// 5 seconds.
+const markersById = new Map();
+
+function popupHtml(vehicle) {
+    const label = vehicle.label || vehicle.vehicleId;
+    const secondsAgo = Math.round(Date.now() / 1000 - vehicle.lastUpdateTime);
+    return `
+        <strong>${label}</strong><br>
+        Route: ${vehicle.routeId ?? "n/a"}<br>
+        Updated ${secondsAgo}s ago
+    `;
+}
+
+function updateMarkers(vehicles) {
+    const seenIds = new Set();
+
+    for (const vehicle of vehicles) {
+        seenIds.add(vehicle.vehicleId);
+        const color = colorFor(vehicle.vehicleRouteType);
+        const existing = markersById.get(vehicle.vehicleId);
+
+        if (existing) {
+            existing.setLatLng([vehicle.lat, vehicle.lon]);
+            existing.setStyle({ color, fillColor: color });
+            existing.setPopupContent(popupHtml(vehicle));
+        } else {
+            const marker = L.circleMarker([vehicle.lat, vehicle.lon], {
+                radius: 6,
+                color,
+                fillColor: color,
+                fillOpacity: 0.8,
+                weight: 2,
+            }).bindPopup(popupHtml(vehicle));
+            marker.addTo(map);
+            markersById.set(vehicle.vehicleId, marker);
+        }
+    }
+
+    // A vehicle BKK stopped reporting (out of range, gone offline, trip
+    // ended) won't be in this poll's response - drop its marker rather than
+    // leaving a stale dot behind forever.
+    for (const [id, marker] of markersById) {
+        if (!seenIds.has(id)) {
+            map.removeLayer(marker);
+            markersById.delete(id);
+        }
+    }
+}
+
+function refreshVehicles() {
+    const url = `/api/vehicles?lat=${CENTER[0]}&lon=${CENTER[1]}&radius=${RADIUS_METERS}`;
+    fetch(url)
+        .then((response) => response.json())
+        .then(updateMarkers)
+        .catch((error) => console.error("Failed to fetch vehicles", error));
+}
+
+refreshVehicles();
+setInterval(refreshVehicles, POLL_INTERVAL_MS);
