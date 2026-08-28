@@ -42,6 +42,8 @@ public class VehiclePositionConsumer {
                 vehicle.serviceDate(),
                 vehicle.status(),
                 vehicle.stopDistancePercent(),
+                vehicle.deviated(),
+                vehicle.stale(),
                 Instant.now()
         );
         repository.save(snapshot);

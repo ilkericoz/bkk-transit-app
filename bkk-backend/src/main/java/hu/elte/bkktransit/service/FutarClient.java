@@ -114,7 +114,9 @@ public class FutarClient {
                     v.hasNonNull("stopSequence") ? v.path("stopSequence").asInt() : null,
                     v.path("serviceDate").asText(null),
                     v.path("status").asText(null),
-                    v.hasNonNull("stopDistancePercent") ? v.path("stopDistancePercent").asInt() : null
+                    v.hasNonNull("stopDistancePercent") ? v.path("stopDistancePercent").asInt() : null,
+                    v.hasNonNull("deviated") ? v.path("deviated").asBoolean() : null,
+                    v.hasNonNull("stale") ? v.path("stale").asBoolean() : null
             ));
         }
         return vehicles;

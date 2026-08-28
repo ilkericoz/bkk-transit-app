@@ -53,6 +53,13 @@ public class VehiclePositionSnapshot {
     private String status;
     private Integer stopDistancePercent;
 
+    // Added after auditing BKK's raw response for fields we were silently
+    // dropping (see VehiclePosition's javadoc). deviated is a plausible
+    // delay-prediction feature; stale marks a sighting BKK itself doesn't
+    // fully trust, so label-building can choose to exclude it later.
+    private Boolean deviated;
+    private Boolean stale;
+
     // When *our* consumer wrote this row - distinct from lastUpdateTime
     // above (that one's BKK's clock; this one's ours, and is what history
     // queries will actually filter/sort on).
@@ -65,7 +72,8 @@ public class VehiclePositionSnapshot {
                                     double lat, double lon, Double bearing, String label,
                                     long lastUpdateTime, String tripId, String stopId,
                                     Integer stopSequence, String serviceDate, String status,
-                                    Integer stopDistancePercent, Instant recordedAt) {
+                                    Integer stopDistancePercent, Boolean deviated, Boolean stale,
+                                    Instant recordedAt) {
         this.vehicleId = vehicleId;
         this.routeId = routeId;
         this.vehicleRouteType = vehicleRouteType;
@@ -80,6 +88,8 @@ public class VehiclePositionSnapshot {
         this.serviceDate = serviceDate;
         this.status = status;
         this.stopDistancePercent = stopDistancePercent;
+        this.deviated = deviated;
+        this.stale = stale;
         this.recordedAt = recordedAt;
     }
 
@@ -141,6 +151,14 @@ public class VehiclePositionSnapshot {
 
     public Integer getStopDistancePercent() {
         return stopDistancePercent;
+    }
+
+    public Boolean getDeviated() {
+        return deviated;
+    }
+
+    public Boolean getStale() {
+        return stale;
     }
 
     public Instant getRecordedAt() {

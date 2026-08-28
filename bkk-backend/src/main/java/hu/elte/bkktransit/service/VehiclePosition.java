@@ -11,6 +11,13 @@ package hu.elte.bkktransit.service;
  * status/stopDistancePercent let us detect "vehicle was physically AT this
  * stop just now" (STOPPED_AT, 100%) as the ground-truth actual-arrival
  * event, rather than trusting BKK's own predicted times.
+ *
+ * deviated/stale added after checking BKK's raw response for fields we
+ * were silently dropping: deviated (off-route) is a plausible real delay
+ * predictor and always present; stale is rare but marks a sighting BKK
+ * itself considers unreliable - worth being able to exclude those from
+ * future label-building rather than treating every sighting as equally
+ * trustworthy.
  */
 public record VehiclePosition(
         String vehicleId,
@@ -26,6 +33,8 @@ public record VehiclePosition(
         Integer stopSequence,
         String serviceDate,
         String status,
-        Integer stopDistancePercent
+        Integer stopDistancePercent,
+        Boolean deviated,
+        Boolean stale
 ) {
 }
