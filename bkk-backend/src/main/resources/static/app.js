@@ -29,6 +29,29 @@ function colorFor(routeType) {
     return ROUTE_TYPE_COLORS[routeType] ?? DEFAULT_COLOR;
 }
 
+// Keyed by the real-time routeId format ("BKK_" + static route_id, same
+// prefix convention as tripId/stopId) so lookups from vehicle data need no
+// extra string surgery at use-site. Loaded once on page load - routes.txt
+// is ~390 static rows, not something that changes while the page is open.
+let routesById = new Map();
+
+function loadRoutes() {
+    return fetch("/api/routes")
+        .then((response) => response.json())
+        .then((routes) => {
+            routesById = new Map(routes.map((route) => [`BKK_${route.routeId}`, route]));
+        })
+        .catch((error) => console.error("Failed to fetch routes", error));
+}
+
+// Falls back to the raw routeId (e.g. "BKK_3020") if routes haven't loaded
+// yet or this particular route isn't in the static feed for some reason -
+// better to show something than nothing.
+function routeLabel(vehicle) {
+    const route = routesById.get(vehicle.routeId);
+    return route?.routeShortName || vehicle.routeId || "n/a";
+}
+
 const map = L.map("map").setView(CENTER, 13);
 
 L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
@@ -64,7 +87,7 @@ function popupHtml(vehicle) {
     const secondsAgo = Math.round(Date.now() / 1000 - vehicle.lastUpdateTime);
     return `
         <strong>${label}</strong><br>
-        Route: ${vehicle.routeId ?? "n/a"}<br>
+        Route: ${routeLabel(vehicle)}<br>
         Trip: ${vehicle.tripId ?? "n/a"}<br>
         ${statusLine(vehicle)}<br>
         Updated ${secondsAgo}s ago
@@ -115,5 +138,5 @@ function refreshVehicles() {
         .catch((error) => console.error("Failed to fetch vehicles", error));
 }
 
-refreshVehicles();
+loadRoutes().then(refreshVehicles);
 setInterval(refreshVehicles, POLL_INTERVAL_MS);

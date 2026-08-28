@@ -1,5 +1,6 @@
 package hu.elte.bkktransit.service;
 
+import hu.elte.bkktransit.repository.RouteRepository;
 import hu.elte.bkktransit.repository.StopRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -23,15 +24,21 @@ public class StartupGtfsLoader implements CommandLineRunner {
     private static final Logger log = LoggerFactory.getLogger(StartupGtfsLoader.class);
 
     private final StopRepository stopRepository;
+    private final RouteRepository routeRepository;
     private final GtfsImportService gtfsImportService;
     private final String stopsFilePath;
+    private final String routesFilePath;
 
     public StartupGtfsLoader(StopRepository stopRepository,
+                              RouteRepository routeRepository,
                               GtfsImportService gtfsImportService,
-                              @Value("${bkk.gtfs.stops-file}") String stopsFilePath) {
+                              @Value("${bkk.gtfs.stops-file}") String stopsFilePath,
+                              @Value("${bkk.gtfs.routes-file}") String routesFilePath) {
         this.stopRepository = stopRepository;
+        this.routeRepository = routeRepository;
         this.gtfsImportService = gtfsImportService;
         this.stopsFilePath = stopsFilePath;
+        this.routesFilePath = routesFilePath;
     }
 
     @Override
@@ -39,9 +46,17 @@ public class StartupGtfsLoader implements CommandLineRunner {
         if (stopRepository.count() > 0) {
             log.info("Stops table already populated ({} rows) - skipping GTFS import.",
                     stopRepository.count());
-            return;
+        } else {
+            log.info("Stops table is empty - importing from {}", stopsFilePath);
+            gtfsImportService.importStops(Path.of(stopsFilePath));
         }
-        log.info("Stops table is empty - importing from {}", stopsFilePath);
-        gtfsImportService.importStops(Path.of(stopsFilePath));
+
+        if (routeRepository.count() > 0) {
+            log.info("Routes table already populated ({} rows) - skipping GTFS import.",
+                    routeRepository.count());
+        } else {
+            log.info("Routes table is empty - importing from {}", routesFilePath);
+            gtfsImportService.importRoutes(Path.of(routesFilePath));
+        }
     }
 }
