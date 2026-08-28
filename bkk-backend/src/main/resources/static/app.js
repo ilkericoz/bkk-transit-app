@@ -2,7 +2,11 @@
 // recomputing lat/lon/radius from the map's current pan/zoom. Simpler, and
 // good enough to demo "live vehicles across the city" convincingly.
 const CENTER = [47.4979, 19.0402];
-const RADIUS_METERS = 6000;
+// 25km, not the original 6km - matches the ingestion pipeline's radius
+// (see the comment on bkk.ingestion.radius-meters in application.properties
+// for how this number was picked). BKK's API itself caps out somewhere
+// between 25km and 28km (LIMIT_EXCEEDED beyond that), found empirically.
+const RADIUS_METERS = 25000;
 // 10s, not 5s: checked BKK's actual data - most vehicles only report a new
 // GPS position every 10-20+ seconds, so polling faster than that just
 // re-fetches data that hasn't changed yet.
@@ -52,7 +56,10 @@ function routeLabel(vehicle) {
     return route?.routeShortName || vehicle.routeId || "n/a";
 }
 
-const map = L.map("map").setView(CENTER, 13);
+// Zoom 13 (city-district scale) made sense for the old 6km radius but
+// would hide most of a 25km radius's worth of vehicles off-screen until
+// the viewer manually zoomed out - 11 fits the wider metro area by default.
+const map = L.map("map").setView(CENTER, 11);
 
 L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
     maxZoom: 19,
