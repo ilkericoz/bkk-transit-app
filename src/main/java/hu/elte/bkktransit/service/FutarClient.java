@@ -108,7 +108,13 @@ public class FutarClient {
                     v.path("location").path("lon").asDouble(),
                     v.hasNonNull("bearing") ? v.path("bearing").asDouble() : null,
                     v.path("label").asText(null),
-                    v.path("lastUpdateTime").asLong()
+                    v.path("lastUpdateTime").asLong(),
+                    v.path("tripId").asText(null),
+                    v.path("stopId").asText(null),
+                    v.hasNonNull("stopSequence") ? v.path("stopSequence").asInt() : null,
+                    v.path("serviceDate").asText(null),
+                    v.path("status").asText(null),
+                    v.hasNonNull("stopDistancePercent") ? v.path("stopDistancePercent").asInt() : null
             ));
         }
         return vehicles;

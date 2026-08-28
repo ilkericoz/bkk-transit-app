@@ -19,7 +19,8 @@ import java.time.Instant;
 @Entity
 @Table(name = "vehicle_position_snapshots", indexes = {
         @Index(name = "idx_snapshot_vehicle_id", columnList = "vehicleId"),
-        @Index(name = "idx_snapshot_recorded_at", columnList = "recordedAt")
+        @Index(name = "idx_snapshot_recorded_at", columnList = "recordedAt"),
+        @Index(name = "idx_snapshot_trip_id", columnList = "tripId")
 })
 public class VehiclePositionSnapshot {
 
@@ -38,6 +39,20 @@ public class VehiclePositionSnapshot {
     // BKK's own timestamp for when the vehicle reported this position.
     private long lastUpdateTime;
 
+    // Added for stage 5 (delay prediction) - see VehiclePosition's javadoc
+    // for why these matter: tripId is the join key back to static GTFS
+    // stop_times.txt, stopSequence disambiguates which visit to that trip's
+    // stop list this is, serviceDate picks the right GTFS calendar day, and
+    // status/stopDistancePercent together identify the "vehicle just
+    // arrived at this stop" event (STOPPED_AT, 100%) that gives us the
+    // actual side of the actual-vs-scheduled delay computation.
+    private String tripId;
+    private String stopId;
+    private Integer stopSequence;
+    private String serviceDate;
+    private String status;
+    private Integer stopDistancePercent;
+
     // When *our* consumer wrote this row - distinct from lastUpdateTime
     // above (that one's BKK's clock; this one's ours, and is what history
     // queries will actually filter/sort on).
@@ -48,7 +63,9 @@ public class VehiclePositionSnapshot {
 
     public VehiclePositionSnapshot(String vehicleId, String routeId, String vehicleRouteType,
                                     double lat, double lon, Double bearing, String label,
-                                    long lastUpdateTime, Instant recordedAt) {
+                                    long lastUpdateTime, String tripId, String stopId,
+                                    Integer stopSequence, String serviceDate, String status,
+                                    Integer stopDistancePercent, Instant recordedAt) {
         this.vehicleId = vehicleId;
         this.routeId = routeId;
         this.vehicleRouteType = vehicleRouteType;
@@ -57,6 +74,12 @@ public class VehiclePositionSnapshot {
         this.bearing = bearing;
         this.label = label;
         this.lastUpdateTime = lastUpdateTime;
+        this.tripId = tripId;
+        this.stopId = stopId;
+        this.stopSequence = stopSequence;
+        this.serviceDate = serviceDate;
+        this.status = status;
+        this.stopDistancePercent = stopDistancePercent;
         this.recordedAt = recordedAt;
     }
 
@@ -94,6 +117,30 @@ public class VehiclePositionSnapshot {
 
     public long getLastUpdateTime() {
         return lastUpdateTime;
+    }
+
+    public String getTripId() {
+        return tripId;
+    }
+
+    public String getStopId() {
+        return stopId;
+    }
+
+    public Integer getStopSequence() {
+        return stopSequence;
+    }
+
+    public String getServiceDate() {
+        return serviceDate;
+    }
+
+    public String getStatus() {
+        return status;
+    }
+
+    public Integer getStopDistancePercent() {
+        return stopDistancePercent;
     }
 
     public Instant getRecordedAt() {

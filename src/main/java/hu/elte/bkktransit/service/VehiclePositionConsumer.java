@@ -36,6 +36,12 @@ public class VehiclePositionConsumer {
                 vehicle.bearing(),
                 vehicle.label(),
                 vehicle.lastUpdateTime(),
+                vehicle.tripId(),
+                vehicle.stopId(),
+                vehicle.stopSequence(),
+                vehicle.serviceDate(),
+                vehicle.status(),
+                vehicle.stopDistancePercent(),
                 Instant.now()
         );
         repository.save(snapshot);
