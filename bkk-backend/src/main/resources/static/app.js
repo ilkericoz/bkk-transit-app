@@ -42,12 +42,31 @@ L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
 // 5 seconds.
 const markersById = new Map();
 
+// Turns BKK's raw status + stopDistancePercent into one readable line - the
+// same fields the stage-5 label pipeline joins against GTFS stop_times.txt
+// to compute delay, surfaced here as a visible sanity check that the data
+// we're now collecting looks right, not just something living in Postgres.
+function statusLine(vehicle) {
+    if (!vehicle.stopId) {
+        return "n/a";
+    }
+    if (vehicle.status === "STOPPED_AT") {
+        return `Stopped at ${vehicle.stopId}`;
+    }
+    if (vehicle.status === "IN_TRANSIT_TO") {
+        return `En route to ${vehicle.stopId} (${vehicle.stopDistancePercent ?? "?"}%)`;
+    }
+    return `${vehicle.status ?? "n/a"} - ${vehicle.stopId}`;
+}
+
 function popupHtml(vehicle) {
     const label = vehicle.label || vehicle.vehicleId;
     const secondsAgo = Math.round(Date.now() / 1000 - vehicle.lastUpdateTime);
     return `
         <strong>${label}</strong><br>
         Route: ${vehicle.routeId ?? "n/a"}<br>
+        Trip: ${vehicle.tripId ?? "n/a"}<br>
+        ${statusLine(vehicle)}<br>
         Updated ${secondsAgo}s ago
     `;
 }
