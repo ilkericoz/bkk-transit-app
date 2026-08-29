@@ -18,22 +18,21 @@ training (the i.i.d. assumption from stats courses breaks down for
 time-series data - see the project memory for why this was flagged early).
 """
 
+import sys
 from pathlib import Path
 
 import pandas as pd
-from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.compose import ColumnTransformer
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_absolute_error, root_mean_squared_error
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 
-DATA_PATH = Path(__file__).resolve().parent.parent / "data" / "delay_labels.csv"
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from delay_model import ALL_FEATURES, CATEGORICAL_FEATURES, NUMERIC_FEATURES, TARGET, DelayModel
 
-CATEGORICAL_FEATURES = ["route_id", "vehicle_route_type", "stop_id"]
-NUMERIC_FEATURES = ["hour", "day_of_week", "stop_sequence"]
-ALL_FEATURES = CATEGORICAL_FEATURES + NUMERIC_FEATURES
-TARGET = "delay_seconds"
+DATA_PATH = Path(__file__).resolve().parent.parent / "data" / "delay_labels.csv"
+MODEL_PATH = Path(__file__).resolve().parent.parent / "models" / "delay_model.joblib"
 
 VALIDATION_FRACTION = 0.2
 
@@ -84,35 +83,10 @@ def linear_regression_predict(train: pd.DataFrame, val: pd.DataFrame):
 
 
 def gradient_boosted_predict(train: pd.DataFrame, val: pd.DataFrame):
-    # HistGradientBoostingRegressor's native categorical handling packs
-    # category codes into a uint8, capping cardinality at 255 - route_id
-    # (~320 values) and stop_id (thousands) both blow past that. So instead
-    # of one-hot/native-categorical for those two, mean-target-encode them:
-    # replace each id with its *train-only* average delay (a standard trick
-    # for high-cardinality categoricals in gradient boosting - conceptually
-    # the same per-group average the baseline model uses, just handed to
-    # the tree as one more numeric feature rather than the whole answer).
-    # Unseen ids in val fall back to the train-set global mean.
-    global_mean = train[TARGET].mean()
-    train_x, val_x = train[ALL_FEATURES].copy(), val[ALL_FEATURES].copy()
-    for col in ["route_id", "stop_id"]:
-        id_mean_delay = train.groupby(col)[TARGET].mean()
-        encoded = f"{col}_mean_delay"
-        train_x[encoded] = train_x[col].map(id_mean_delay)
-        val_x[encoded] = val_x[col].map(id_mean_delay).fillna(global_mean)
-        train_x.drop(columns=col, inplace=True)
-        val_x.drop(columns=col, inplace=True)
-
-    # vehicle_route_type only has 4 distinct values (BUS/TRAM/TROLLEYBUS/
-    # SUBURBAN_RAILWAY) - comfortably under the 255 cap, so it gets true
-    # native categorical handling instead of mean-encoding.
-    categories = pd.CategoricalDtype(categories=train_x["vehicle_route_type"].dropna().unique())
-    train_x["vehicle_route_type"] = train_x["vehicle_route_type"].astype(categories)
-    val_x["vehicle_route_type"] = val_x["vehicle_route_type"].astype(categories)
-
-    model = HistGradientBoostingRegressor(categorical_features="from_dtype", random_state=42)
-    model.fit(train_x, train[TARGET])
-    return model.predict(val_x)
+    # Encoding lives in delay_model.DelayModel (shared with the FastAPI
+    # service) so training and serving can never encode a request
+    # differently than the model was trained on.
+    return DelayModel.fit(train).predict(val)
 
 
 def main() -> None:
@@ -123,6 +97,16 @@ def main() -> None:
     evaluate("baseline (per-route avg)", val[TARGET], baseline_predict(train, val))
     evaluate("linear regression", val[TARGET], linear_regression_predict(train, val))
     evaluate("gradient boosted trees", val[TARGET], gradient_boosted_predict(train, val))
+
+    # The comparison above holds out the most recent slice to validate
+    # against; once we trust the approach (which - see the training-window
+    # caveat this was committed with - we don't fully yet), the production
+    # artifact is refit on ALL available labeled data, not just `train`,
+    # since there's no more need to hold anything back once nothing is
+    # being validated anymore.
+    print(f"\nRefitting on full dataset ({len(df)} rows) and saving to {MODEL_PATH}")
+    final_model = DelayModel.fit(df)
+    final_model.save(MODEL_PATH)
 
 
 if __name__ == "__main__":
