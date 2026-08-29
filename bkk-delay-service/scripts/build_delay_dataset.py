@@ -35,6 +35,19 @@ import psycopg2
 
 BUDAPEST_TZ = ZoneInfo("Europe/Budapest")
 
+# Rows beyond this are dropped as outliers, not delay. Investigated a batch
+# of these by hand (2026-08-29, ~107k rows): the extreme ones aren't random
+# per-stop noise - they're a whole trip shifted by one large, consistent
+# offset (e.g. 5 consecutive stops all ~2h50m off, with the *relative*
+# spacing between them still matching the schedule exactly). That pattern
+# means the join itself (trip_id + stop_sequence) is pairing correctly -
+# what's actually happening is BKK reusing a trip_id for a real-world run
+# at a materially different time than our static stop_times.txt snapshot
+# says (a dispatch reassignment or intraday schedule change), not a bug
+# here. Only ~0.03% of rows hit this, so a simple threshold is enough -
+# no need for anything smarter than "drop it" yet.
+MAX_ABS_DELAY_SECONDS = 3600
+
 GTFS_DIR = Path(__file__).resolve().parent.parent.parent / "bkk-backend" / "gtfs-data" / "raw"
 STOP_TIMES_PATH = GTFS_DIR / "stop_times.txt"
 
@@ -145,6 +158,12 @@ def build_dataset() -> pd.DataFrame:
     merged["delay_seconds"] = (
         merged["actual_arrival"] - merged["scheduled_arrival"]
     ).dt.total_seconds()
+
+    before = len(merged)
+    merged = merged[merged["delay_seconds"].abs() <= MAX_ABS_DELAY_SECONDS]
+    dropped = before - len(merged)
+    if dropped:
+        print(f"Dropped {dropped} outlier rows (|delay| > {MAX_ABS_DELAY_SECONDS}s) - see MAX_ABS_DELAY_SECONDS comment")
 
     return merged[[
         "gtfs_trip_id", "route_id", "vehicle_route_type", "stop_id", "stop_sequence",
