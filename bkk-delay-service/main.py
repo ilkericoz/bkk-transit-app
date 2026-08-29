@@ -7,6 +7,18 @@ folding ML serving into the Java app itself.
 Run locally with: uvicorn main:app --reload --port 8000
 (requires models/delay_model.joblib to already exist - run
 scripts/train_model.py first if it doesn't.)
+
+To reach this from another device on the same LAN (e.g. testing from a
+phone), add --host 0.0.0.0 to the command above - uvicorn binds to
+localhost only by default, unlike Spring Boot's embedded Tomcat which
+already listens on all interfaces out of the box. Also requires a Windows
+Firewall inbound rule for TCP 8000 (created 2026-08-29, scoped to the
+192.168.1.0/24 home LAN subnet rather than opening it broadly - see
+"BKK dev - FastAPI 8000 (LAN only)" in Windows Defender Firewall if it
+ever needs recreating). Then hit http://<this-machine's-LAN-IP>:8000/docs
+from the other device. The Spring Boot map (port 8080) has the same
+LAN-only firewall rule and needs no code change to be reachable the
+same way.
 """
 
 from contextlib import asynccontextmanager
