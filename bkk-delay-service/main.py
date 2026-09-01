@@ -29,12 +29,15 @@ from zoneinfo import ZoneInfo
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from delay_model import DelayModel
+from delay_model import BaseDelayModel
 
 MODEL_PATH = Path(__file__).resolve().parent / "models" / "delay_model.joblib"
 BUDAPEST_TZ = ZoneInfo("Europe/Budapest")
 
-model: DelayModel | None = None
+# Whichever candidate (baseline/linear/gbt) train_model.py's walk-forward
+# comparison picked as the winner - joblib pickles the concrete class along
+# with the object, so this doesn't need to know in advance which one it is.
+model: BaseDelayModel | None = None
 
 
 @asynccontextmanager
@@ -42,7 +45,7 @@ async def lifespan(app: FastAPI):
     global model
     if not MODEL_PATH.exists():
         raise RuntimeError(f"No trained model at {MODEL_PATH} - run scripts/train_model.py first.")
-    model = DelayModel.load(MODEL_PATH)
+    model = BaseDelayModel.load(MODEL_PATH)
     yield
 
 
@@ -68,7 +71,7 @@ class DelayPredictionResponse(BaseModel):
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok", "model_loaded": model is not None}
+    return {"status": "ok", "model_loaded": model is not None, "model_type": model.name if model else None}
 
 
 @app.post("/predict", response_model=DelayPredictionResponse)
