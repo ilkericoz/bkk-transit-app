@@ -26,6 +26,20 @@ baseline in 2 of 3 folds, while linear regression won consistently. Rather
 than hardcoding "ship linear" (which would itself go stale once GBT
 eventually earns its keep with more day-diversity), the winner each run is
 whichever candidate actually has the lowest mean walk-forward MAE.
+
+Run history (mean walk-forward MAE, lower is better) - kept here rather
+than only in chat, per the project's "don't leave things as tribal
+knowledge" convention:
+  2026-09-01, 1,123,511 rows, 3 folds:
+    baseline ~111s / linear ~97s (std 7.0s) / gbt ~241s (std 141s, blew up
+    on evening-only->weekend and weekend->weekday-rush folds). Winner: linear.
+  2026-09-03, 1,503,915 rows, 6 folds:
+    baseline 106.5s / linear 97.6s (std 6.2s) / gbt 171.1s (std 122.1s,
+    still wrecked by one thin-data 08-29 fold at 429s, but its other folds
+    -88.9s/205.4s/107.1s/102.6s/93.5s- are visibly converging toward
+    linear's range). Winner: linear again, but gbt is trending competitive
+    as more day-diversity accumulates - worth rerunning again once another
+    week or two has passed to see if it flips.
 """
 
 import sys
