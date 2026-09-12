@@ -72,6 +72,12 @@ L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
 // 5 seconds.
 const markersById = new Map();
 
+// Latest known data per vehicle, kept alongside markersById so the
+// 'popupopen' handler below (bound once, at marker creation) can always
+// look up this vehicle's *current* trip/stop rather than whatever it was
+// when the marker was first created.
+const vehiclesById = new Map();
+
 // Turns BKK's raw status + stopDistancePercent into one readable line - the
 // same fields the stage-5 label pipeline joins against GTFS stop_times.txt
 // to compute delay, surfaced here as a visible sanity check that the data
@@ -89,6 +95,33 @@ function statusLine(vehicle) {
     return `${vehicle.status ?? "n/a"} - ${vehicle.stopId}`;
 }
 
+// Delay predictions are fetched lazily (see maybeFetchPrediction below) -
+// keyed here by vehicleId so a poll's setPopupContent() re-render (every
+// 10s, see refreshVehicles) doesn't wipe out a prediction that's already
+// loading or already came back, and so a still-open popup can be updated
+// in place once the fetch resolves rather than waiting for the next poll.
+const predictionsByVehicleId = new Map();
+
+function predictionLine(vehicle) {
+    if (!vehicle.tripId || !vehicle.stopId || vehicle.stopSequence == null) {
+        return "";
+    }
+    const prediction = predictionsByVehicleId.get(vehicle.vehicleId);
+    if (!prediction) {
+        return "";
+    }
+    if (prediction.status === "loading") {
+        return "<br>Predicted delay: …";
+    }
+    if (prediction.status === "error") {
+        return "<br>Predicted delay: (prediction service unavailable)";
+    }
+    if (!prediction.available) {
+        return "<br>Predicted delay: n/a (not on our imported schedule)";
+    }
+    return `<br>Predicted delay: ${Math.round(prediction.predictedDelaySeconds)}s`;
+}
+
 function popupHtml(vehicle) {
     const label = vehicle.label || vehicle.vehicleId;
     const secondsAgo = Math.round(Date.now() / 1000 - vehicle.lastUpdateTime);
@@ -97,8 +130,62 @@ function popupHtml(vehicle) {
         Route: ${routeLabel(vehicle)}<br>
         Trip: ${vehicle.tripId ?? "n/a"}<br>
         ${statusLine(vehicle)}<br>
-        Updated ${secondsAgo}s ago
+        Updated ${secondsAgo}s ago${predictionLine(vehicle)}
     `;
+}
+
+// Called only when a vehicle's popup is actually opened (see 'popupopen'
+// below), not for every vehicle on every 10s poll - with ~1700 vehicles in
+// view, predicting all of them constantly would be ~1700 calls/10s to a
+// sidecar nobody asked about. A short TTL avoids re-fetching every time the
+// same popup is reopened moments apart, while still refreshing if it's been
+// sitting open a while (the vehicle's actual stop/trip can move on).
+const PREDICTION_TTL_MS = 15000;
+
+function maybeFetchPrediction(vehicle, marker) {
+    if (!vehicle.tripId || !vehicle.stopId || vehicle.stopSequence == null) {
+        return; // statusLine already shows "n/a" for these - nothing to predict.
+    }
+    const existing = predictionsByVehicleId.get(vehicle.vehicleId);
+    if (existing && existing.status !== "error" && Date.now() - existing.fetchedAt < PREDICTION_TTL_MS) {
+        return;
+    }
+
+    predictionsByVehicleId.set(vehicle.vehicleId, { status: "loading", fetchedAt: Date.now() });
+    marker.setPopupContent(popupHtml(vehicle));
+
+    fetch("/api/vehicles/delay-prediction", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+            tripId: vehicle.tripId,
+            routeId: vehicle.routeId,
+            stopId: vehicle.stopId,
+            vehicleRouteType: vehicle.vehicleRouteType,
+            stopSequence: vehicle.stopSequence,
+            serviceDate: vehicle.serviceDate,
+        }),
+    })
+        .then((response) => {
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            return response.json();
+        })
+        .then((result) => {
+            predictionsByVehicleId.set(vehicle.vehicleId, { ...result, status: "ok", fetchedAt: Date.now() });
+        })
+        .catch((error) => {
+            console.error("Failed to fetch delay prediction", error);
+            predictionsByVehicleId.set(vehicle.vehicleId, { status: "error", fetchedAt: Date.now() });
+        })
+        .finally(() => {
+            // Only touch the DOM if this vehicle's marker is still the one
+            // on the map (updateMarkers may have swapped it) and its popup
+            // is still open - otherwise this just updates the cache above
+            // for whenever it's next opened.
+            if (markersById.get(vehicle.vehicleId) === marker && marker.isPopupOpen()) {
+                marker.setPopupContent(popupHtml(vehicle));
+            }
+        });
 }
 
 function updateMarkers(vehicles) {
@@ -106,6 +193,7 @@ function updateMarkers(vehicles) {
 
     for (const vehicle of vehicles) {
         seenIds.add(vehicle.vehicleId);
+        vehiclesById.set(vehicle.vehicleId, vehicle);
         const color = colorFor(vehicle.vehicleRouteType);
         const existing = markersById.get(vehicle.vehicleId);
 
@@ -121,6 +209,10 @@ function updateMarkers(vehicles) {
                 fillOpacity: 0.8,
                 weight: 2,
             }).bindPopup(popupHtml(vehicle));
+            // Only predict for a vehicle someone actually looked at, and
+            // re-check on every open (not just the first) since the TTL in
+            // maybeFetchPrediction may have expired by then.
+            marker.on("popupopen", () => maybeFetchPrediction(vehiclesById.get(vehicle.vehicleId), marker));
             marker.addTo(map);
             markersById.set(vehicle.vehicleId, marker);
         }
@@ -133,6 +225,8 @@ function updateMarkers(vehicles) {
         if (!seenIds.has(id)) {
             map.removeLayer(marker);
             markersById.delete(id);
+            vehiclesById.delete(id);
+            predictionsByVehicleId.delete(id);
         }
     }
 }
