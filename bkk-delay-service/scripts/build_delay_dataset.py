@@ -26,14 +26,14 @@ suspiciously close to that same magnitude.
 
 import csv
 import os
-from datetime import datetime, timedelta
+import sys
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 import pandas as pd
 import psycopg2
 
-BUDAPEST_TZ = ZoneInfo("Europe/Budapest")
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from gtfs_schedule import BUDAPEST_TZ, to_scheduled_datetime
 
 # Rows beyond this are dropped as outliers, not delay. Investigated a batch
 # of these by hand (2026-08-29, ~107k rows): the extreme ones aren't random
@@ -115,19 +115,6 @@ def fetch_scheduled_times(trip_ids: set[str]) -> pd.DataFrame:
     scheduled = pd.concat(matches, ignore_index=True)
     scheduled["stop_sequence"] = scheduled["stop_sequence"].astype(int)
     return scheduled
-
-
-def to_scheduled_datetime(service_date: str, arrival_time: str) -> datetime:
-    """
-    GTFS arrival_time is "HH:MM:SS" civil time *relative to service_date*,
-    and GTFS deliberately allows hours >= 24 for trips past midnight (e.g.
-    "25:10:00" for 01:10 the following day) rather than rolling the date -
-    so we parse it as a plain (hours, minutes, seconds) offset added onto
-    service_date's midnight, not as a wall-clock time directly.
-    """
-    hours, minutes, seconds = (int(part) for part in arrival_time.split(":"))
-    midnight = datetime.strptime(service_date, "%Y%m%d").replace(tzinfo=BUDAPEST_TZ)
-    return midnight + timedelta(hours=hours, minutes=minutes, seconds=seconds)
 
 
 def build_dataset() -> pd.DataFrame:

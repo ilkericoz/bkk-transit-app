@@ -30,6 +30,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from delay_model import BaseDelayModel
+from gtfs_schedule import ScheduleLookup
 
 MODEL_PATH = Path(__file__).resolve().parent / "models" / "delay_model.joblib"
 BUDAPEST_TZ = ZoneInfo("Europe/Budapest")
@@ -39,13 +40,20 @@ BUDAPEST_TZ = ZoneInfo("Europe/Budapest")
 # with the object, so this doesn't need to know in advance which one it is.
 model: BaseDelayModel | None = None
 
+# Loaded once at startup (see lifespan below) - resolves the /predict/from-
+# vehicle endpoint's scheduled_arrival from the live feed's own
+# (tripId, stopSequence, serviceDate) fields, since the Java side never
+# imported stop_times.txt itself (see that endpoint's docstring for why).
+schedule_lookup: ScheduleLookup | None = None
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global model
+    global model, schedule_lookup
     if not MODEL_PATH.exists():
         raise RuntimeError(f"No trained model at {MODEL_PATH} - run scripts/train_model.py first.")
     model = BaseDelayModel.load(MODEL_PATH)
+    schedule_lookup = ScheduleLookup()
     yield
 
 
@@ -69,9 +77,30 @@ class DelayPredictionResponse(BaseModel):
     predicted_delay_seconds: float
 
 
+class LiveVehiclePredictionRequest(BaseModel):
+    """
+    Mirrors the fields BKK's own live vehicle-position feed returns (see
+    the Java side's VehiclePosition record) - the caller (Spring Boot)
+    just forwards what it already has from its last /api/vehicles poll,
+    rather than needing to know anything about GTFS schedules itself.
+    """
+
+    trip_id: str = Field(examples=["BKK_D19380125"])
+    route_id: str = Field(examples=["BKK_3020"])
+    stop_id: str = Field(examples=["BKK_F00969"])
+    vehicle_route_type: str = Field(examples=["TRAM"])
+    stop_sequence: int = Field(ge=0)
+    service_date: str = Field(examples=["20260912"], description="GTFS serviceDate, YYYYMMDD")
+
+
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok", "model_loaded": model is not None, "model_type": model.name if model else None}
+    return {
+        "status": "ok",
+        "model_loaded": model is not None,
+        "model_type": model.name if model else None,
+        "schedule_loaded": schedule_lookup is not None,
+    }
 
 
 @app.post("/predict", response_model=DelayPredictionResponse)
@@ -89,5 +118,49 @@ def predict(request: DelayPredictionRequest) -> DelayPredictionResponse:
         stop_sequence=request.stop_sequence,
         hour=arrival.hour,
         day_of_week=arrival.weekday(),
+    )
+    return DelayPredictionResponse(predicted_delay_seconds=predicted_delay)
+
+
+@app.post("/predict/from-vehicle", response_model=DelayPredictionResponse)
+def predict_from_vehicle(request: LiveVehiclePredictionRequest) -> DelayPredictionResponse:
+    """
+    The endpoint that actually wires the two services together (added
+    2026-09-12): /predict above needs scheduled_arrival already known,
+    which the Java side has no way to compute - it never imported
+    stop_times.txt (387MB, ~5.08M rows) into Postgres, since nothing
+    needed it there before now. Rather than duplicate that import into a
+    second database just for this, this endpoint accepts the live feed's
+    raw fields and resolves scheduled_arrival itself via ScheduleLookup,
+    which already holds the whole static schedule in memory.
+
+    404s (not a fault worth logging as an error) for the real, expected
+    case where this trip/stop isn't on our imported static schedule at
+    all - a MÁV-START/Volánbusz vehicle BKK's live feed surfaces (see the
+    2026-08-28 route-name investigation), or one running off a schedule
+    version we don't have. The Spring Boot side is expected to turn this
+    into a normal "prediction unavailable" response, not a browser-visible
+    error.
+    """
+    if model is None or schedule_lookup is None:
+        raise HTTPException(status_code=503, detail="Model or schedule not loaded")
+
+    gtfs_trip_id = request.trip_id.removeprefix("BKK_")
+    scheduled_arrival = schedule_lookup.scheduled_arrival(
+        gtfs_trip_id, request.stop_sequence, request.service_date
+    )
+    if scheduled_arrival is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No scheduled arrival found for this trip/stop - not on the imported static GTFS schedule",
+        )
+
+    predicted_delay = model.predict_one(
+        route_id=request.route_id,
+        stop_id=request.stop_id,
+        vehicle_route_type=request.vehicle_route_type,
+        stop_sequence=request.stop_sequence,
+        hour=scheduled_arrival.hour,
+        day_of_week=scheduled_arrival.weekday(),
     )
     return DelayPredictionResponse(predicted_delay_seconds=predicted_delay)
