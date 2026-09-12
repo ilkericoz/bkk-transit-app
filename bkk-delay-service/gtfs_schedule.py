@@ -7,6 +7,7 @@ scheduled_arrival logic; pulled out here so that logic lives in one place
 instead of a batch copy and a live-serving copy slowly drifting apart.
 """
 
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -14,7 +15,16 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 BUDAPEST_TZ = ZoneInfo("Europe/Budapest")
-GTFS_DIR = Path(__file__).resolve().parent.parent / "bkk-backend" / "gtfs-data" / "raw"
+
+# Overridable via GTFS_DATA_DIR (stage 6 / Docker-compose: the sidecar
+# container isn't laid out on disk as a sibling of bkk-backend the way the
+# two services are on a dev machine, so it mounts the host's gtfs-data/raw
+# wherever it likes and points this at that mount instead). Defaults to the
+# same relative traversal that's always worked for native/local dev.
+GTFS_DIR = Path(os.environ.get(
+    "GTFS_DATA_DIR",
+    str(Path(__file__).resolve().parent.parent / "bkk-backend" / "gtfs-data" / "raw"),
+))
 STOP_TIMES_PATH = GTFS_DIR / "stop_times.txt"
 
 

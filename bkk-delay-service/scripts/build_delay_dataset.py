@@ -33,7 +33,7 @@ import pandas as pd
 import psycopg2
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from gtfs_schedule import BUDAPEST_TZ, to_scheduled_datetime
+from gtfs_schedule import BUDAPEST_TZ, STOP_TIMES_PATH, to_scheduled_datetime
 
 # Rows beyond this are dropped as outliers, not delay. Investigated a batch
 # of these by hand (2026-08-29, ~107k rows): the extreme ones aren't random
@@ -47,9 +47,6 @@ from gtfs_schedule import BUDAPEST_TZ, to_scheduled_datetime
 # here. Only ~0.03% of rows hit this, so a simple threshold is enough -
 # no need for anything smarter than "drop it" yet.
 MAX_ABS_DELAY_SECONDS = 3600
-
-GTFS_DIR = Path(__file__).resolve().parent.parent.parent / "bkk-backend" / "gtfs-data" / "raw"
-STOP_TIMES_PATH = GTFS_DIR / "stop_times.txt"
 
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "data"
 OUTPUT_PATH = OUTPUT_DIR / "delay_labels.csv"
