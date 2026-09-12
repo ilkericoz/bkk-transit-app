@@ -1,0 +1,93 @@
+# Stage 6. Postgres is deliberately NOT composed here - it's already a
+# native Windows service that survives a reboot fine on its own (unlike
+# RabbitMQ/Spring Boot/uvicorn, which is the actual gap this stage closes),
+# and containerizing it would mean migrating ~19M+ real rows of already-
+# collected training data for a mostly-cosmetic "one compose file" story.
+# The composed services reach it via host.docker.internal instead - a
+# legitimate real-world pattern (containerized app tier, separately-managed
+# database), not a shortcut.
+#
+# Before `docker compose up --build`:
+#   - mvn -o -DskipTests package   (in bkk-backend/ - builds the jar the
+#     backend Dockerfile copies in; this project builds the jar with the
+#     host's own Maven rather than doing it inside a Docker build stage,
+#     see that Dockerfile's comment for why)
+#   - a trained models/delay_model.joblib must already exist in
+#     bkk-delay-service/ (run scripts/train_model.py first if not)
+#   - BKK_API_KEY must be set in the host shell's environment
+#
+# RabbitMQ's pre-existing standalone container (docker run ... bkk-rabbitmq)
+# should be stopped first (`docker stop bkk-rabbitmq && docker rm bkk-rabbitmq`)
+# so this compose-managed one can bind the same ports - its queue state is
+# disposable (messages are ack'd and drained within seconds), so there's
+# nothing worth migrating out of it.
+
+services:
+  rabbitmq:
+    image: rabbitmq:4-management
+    container_name: bkk-rabbitmq
+    restart: unless-stopped
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+
+  delay-service:
+    build: ./bkk-delay-service
+    container_name: bkk-delay-service
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      # Read-only: this service only ever reads the static schedule, never
+      # writes it. GTFS_DATA_DIR (see gtfs_schedule.py) points it at the
+      # mount instead of the relative-path traversal used natively, since
+      # the two services aren't laid out as disk siblings inside containers.
+      - ./bkk-backend/gtfs-data/raw:/gtfs-data:ro
+      # The trained model and its training data are gitignored/regenerable,
+      # and deliberately NOT baked into the image (see Dockerfile) - mounted
+      # here so retraining on the host (scripts/train_model.py, still a
+      # host-side workflow, see Dockerfile's comment) takes effect on the
+      # next container restart with no image rebuild.
+      - ./bkk-delay-service/models:/app/models
+      - ./bkk-delay-service/data:/app/data
+    environment:
+      GTFS_DATA_DIR: /gtfs-data
+
+  backend:
+    build: ./bkk-backend
+    container_name: bkk-backend
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    depends_on:
+      - rabbitmq
+      - delay-service
+    volumes:
+      - ./bkk-backend/gtfs-data/raw:/gtfs-data:ro
+    environment:
+      # DB_PASSWORD/BKK_API_KEY are read from the host shell's own
+      # environment (${VAR} compose interpolation) - same values already
+      # used for native runs, not new secrets. BKK_API_KEY has no default
+      # here either, matching application.properties' own reasoning: it's
+      # a real personally-issued credential, not a disposable dev value.
+      DB_PASSWORD: ${DB_PASSWORD:-bkk_dev_pw}
+      BKK_API_KEY: ${BKK_API_KEY:?set BKK_API_KEY in your shell environment first}
+      # These three override plain Spring Boot / custom @Value properties
+      # via its standard env-var relaxed binding (dots and dashes -> "_",
+      # uppercased) - no code or application.properties change needed,
+      # environment variables already take priority over the file's values.
+      SPRING_DATASOURCE_URL: jdbc:postgresql://host.docker.internal:5432/bkk_transit
+      SPRING_RABBITMQ_HOST: rabbitmq
+      DELAY_SERVICE_URL: http://delay-service:8000
+      BKK_GTFS_STOPS_FILE: /gtfs-data/stops.txt
+      BKK_GTFS_ROUTES_FILE: /gtfs-data/routes.txt
+    extra_hosts:
+      # host.docker.internal resolves automatically on Docker Desktop
+      # (Windows/Mac) already - this makes it also work if the project is
+      # ever run under native Linux Docker, where it doesn't by default.
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  rabbitmq-data:
