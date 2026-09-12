@@ -41,7 +41,16 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 
 CATEGORICAL_FEATURES = ["route_id", "vehicle_route_type", "stop_id"]
-NUMERIC_FEATURES = ["hour", "day_of_week", "stop_sequence"]
+# upstream_delay_seconds/has_upstream_delay (added 2026-09-12): this trip's
+# own delay at the most recent earlier stop actually observed - a live,
+# per-vehicle signal (delay propagates) rather than a historical route/stop
+# average. has_upstream_delay distinguishes "known to be on-time so far"
+# (0, with the flag set) from "no live reading yet" (0, flag unset) - a
+# trip's first observed stop has nothing upstream to report, and silently
+# treating that the same as a confirmed on-time reading would be wrong.
+# See build_delay_dataset.py for how these are computed for training, and
+# main.py's /predict/from-vehicle for the equivalent live lookup.
+NUMERIC_FEATURES = ["hour", "day_of_week", "stop_sequence", "upstream_delay_seconds", "has_upstream_delay"]
 ALL_FEATURES = CATEGORICAL_FEATURES + NUMERIC_FEATURES
 TARGET = "delay_seconds"
 
@@ -151,6 +160,8 @@ class GbtDelayModel(BaseDelayModel):
             "hour": df["hour"],
             "day_of_week": df["day_of_week"],
             "stop_sequence": df["stop_sequence"],
+            "upstream_delay_seconds": df["upstream_delay_seconds"],
+            "has_upstream_delay": df["has_upstream_delay"],
             "route_id_mean_delay": df["route_id"].map(self.route_mean_delay).fillna(self.global_mean_delay),
             "stop_id_mean_delay": df["stop_id"].map(self.stop_mean_delay).fillna(self.global_mean_delay),
         })

@@ -21,11 +21,13 @@ LAN-only firewall rule and needs no code change to be reachable the
 same way.
 """
 
+import os
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import psycopg2
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
@@ -34,6 +36,20 @@ from gtfs_schedule import ScheduleLookup
 
 MODEL_PATH = Path(__file__).resolve().parent / "models" / "delay_model.joblib"
 BUDAPEST_TZ = ZoneInfo("Europe/Budapest")
+
+# Same Postgres this project's ingestion pipeline writes to - this service
+# never needed it before the upstream-delay feature (2026-09-12), since
+# serving used to be pure file+model, no live data lookups. host is
+# overridable (DB_HOST) for stage 6's sake, same idea as DELAY_SERVICE_URL
+# on the Java side - a container reaches the native Postgres via
+# host.docker.internal, not localhost.
+DB_CONFIG = {
+    "host": os.environ.get("DB_HOST", "localhost"),
+    "port": int(os.environ.get("DB_PORT", "5432")),
+    "dbname": "bkk_transit",
+    "user": "bkk_app",
+    "password": os.environ.get("DB_PASSWORD", "bkk_dev_pw"),
+}
 
 # Whichever candidate (baseline/linear/gbt) train_model.py's walk-forward
 # comparison picked as the winner - joblib pickles the concrete class along
@@ -71,6 +87,13 @@ class DelayPredictionRequest(BaseModel):
     # datetimes are assumed to already be Europe/Budapest civil time
     # (matching GTFS's own convention); timezone-aware ones are converted.
     scheduled_arrival: datetime
+    # Optional: this endpoint has no trip_id, so it can't look the live
+    # upstream delay up itself the way /predict/from-vehicle does - a
+    # caller who has it (e.g. manual testing against a known scenario) can
+    # pass it directly. Left unset, this is treated as "no live reading
+    # available" (has_upstream_delay=False), same as a trip's first stop.
+    upstream_delay_seconds: float = 0.0
+    has_upstream_delay: bool = False
 
 
 class DelayPredictionResponse(BaseModel):
@@ -91,6 +114,49 @@ class LiveVehiclePredictionRequest(BaseModel):
     vehicle_route_type: str = Field(examples=["TRAM"])
     stop_sequence: int = Field(ge=0)
     service_date: str = Field(examples=["20260912"], description="GTFS serviceDate, YYYYMMDD")
+
+
+def fetch_upstream_delay(gtfs_trip_id: str, stop_sequence: int, service_date: str) -> tuple[float, bool]:
+    """
+    This trip's own delay at the most recent earlier stop actually observed
+    today - the live-lookup equivalent of build_delay_dataset.py's batch
+    upstream_delay_seconds (a groupby+shift there; a single targeted query
+    here, since a live request only ever needs one trip's answer). See
+    delay_model.py's NUMERIC_FEATURES comment for why this feature exists.
+
+    Opens a fresh connection per call rather than pooling - this endpoint
+    is click-triggered from the map (see app.js), not a hot path, so the
+    extra ~10-20ms of connection setup isn't worth the added complexity of
+    a pool at this project's current scale.
+    """
+    query = """
+        SELECT stop_sequence, MIN(recorded_at) AS recorded_at
+        FROM vehicle_position_snapshots
+        WHERE trip_id = %s
+          AND service_date = %s
+          AND status = 'STOPPED_AT'
+          AND stop_distance_percent = 100
+          AND stop_sequence < %s
+        GROUP BY stop_sequence
+        ORDER BY stop_sequence DESC
+        LIMIT 1
+    """
+    # trip_id is stored with its real-time "BKK_" prefix in Postgres - only
+    # the static-schedule side (ScheduleLookup) needs it stripped.
+    with psycopg2.connect(**DB_CONFIG) as conn, conn.cursor() as cur:
+        cur.execute(query, (f"BKK_{gtfs_trip_id}", service_date, stop_sequence))
+        row = cur.fetchone()
+
+    if row is None:
+        return 0.0, False  # this trip's first observed stop - nothing upstream yet.
+
+    found_stop_sequence, recorded_at = row
+    scheduled = schedule_lookup.scheduled_arrival(gtfs_trip_id, found_stop_sequence, service_date)
+    if scheduled is None:
+        return 0.0, False
+
+    recorded_at = recorded_at.astimezone(BUDAPEST_TZ)
+    return (recorded_at - scheduled).total_seconds(), True
 
 
 @app.get("/health")
@@ -118,6 +184,8 @@ def predict(request: DelayPredictionRequest) -> DelayPredictionResponse:
         stop_sequence=request.stop_sequence,
         hour=arrival.hour,
         day_of_week=arrival.weekday(),
+        upstream_delay_seconds=request.upstream_delay_seconds,
+        has_upstream_delay=int(request.has_upstream_delay),
     )
     return DelayPredictionResponse(predicted_delay_seconds=predicted_delay)
 
@@ -155,6 +223,10 @@ def predict_from_vehicle(request: LiveVehiclePredictionRequest) -> DelayPredicti
             detail="No scheduled arrival found for this trip/stop - not on the imported static GTFS schedule",
         )
 
+    upstream_delay_seconds, has_upstream_delay = fetch_upstream_delay(
+        gtfs_trip_id, request.stop_sequence, request.service_date
+    )
+
     predicted_delay = model.predict_one(
         route_id=request.route_id,
         stop_id=request.stop_id,
@@ -162,5 +234,7 @@ def predict_from_vehicle(request: LiveVehiclePredictionRequest) -> DelayPredicti
         stop_sequence=request.stop_sequence,
         hour=scheduled_arrival.hour,
         day_of_week=scheduled_arrival.weekday(),
+        upstream_delay_seconds=upstream_delay_seconds,
+        has_upstream_delay=int(has_upstream_delay),
     )
     return DelayPredictionResponse(predicted_delay_seconds=predicted_delay)

@@ -149,9 +149,37 @@ def build_dataset() -> pd.DataFrame:
     if dropped:
         print(f"Dropped {dropped} outlier rows (|delay| > {MAX_ABS_DELAY_SECONDS}s) - see MAX_ABS_DELAY_SECONDS comment")
 
+    # upstream_delay_seconds (added 2026-09-12): this trip's own delay at the
+    # most recent *earlier* stop we actually have an observation for - real
+    # delay propagates (a bus running 4 minutes late tends to still be
+    # running late a few stops on), and unlike route/stop/time-of-day
+    # averages this is a live, per-vehicle signal rather than a historical
+    # one. Computed after outlier filtering so a dropped bad row doesn't
+    # leak a distorted value into its neighbor's feature.
+    #
+    # Grouped by (trip_id, service_date) - not trip_id alone - since the
+    # same trip_id runs again on every subsequent day. shift(1) on the
+    # sorted-by-stop_sequence group gives "the previous stop we observed",
+    # which may skip a stop_sequence or two if that stop had no STOPPED_AT
+    # sighting - correct, since that's exactly what would be knowable live
+    # too (see main.py's /predict/from-vehicle, which runs the equivalent
+    # query against Postgres directly).
+    #
+    # has_upstream_delay flags rows with no earlier observation yet (a
+    # trip's first observed stop) so the model can distinguish "known to be
+    # on-time so far" from "no live reading available" instead of silently
+    # treating both as delay=0.
+    merged = merged.sort_values(["gtfs_trip_id", "service_date", "stop_sequence"])
+    merged["upstream_delay_seconds"] = merged.groupby(
+        ["gtfs_trip_id", "service_date"]
+    )["delay_seconds"].shift(1)
+    merged["has_upstream_delay"] = merged["upstream_delay_seconds"].notna().astype(int)
+    merged["upstream_delay_seconds"] = merged["upstream_delay_seconds"].fillna(0.0)
+
     return merged[[
         "gtfs_trip_id", "route_id", "vehicle_route_type", "stop_id", "stop_sequence",
         "service_date", "scheduled_arrival", "actual_arrival", "delay_seconds",
+        "upstream_delay_seconds", "has_upstream_delay",
     ]].rename(columns={"gtfs_trip_id": "trip_id"})
 
 

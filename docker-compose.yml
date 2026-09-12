@@ -54,6 +54,13 @@ services:
       - ./bkk-delay-service/data:/app/data
     environment:
       GTFS_DATA_DIR: /gtfs-data
+      # Added for the upstream-delay feature (2026-09-12) - main.py now
+      # queries Postgres live (vehicle_position_snapshots) on every
+      # /predict/from-vehicle call, not just at training time.
+      DB_HOST: host.docker.internal
+      DB_PASSWORD: ${DB_PASSWORD:-bkk_dev_pw}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
   backend:
     build: ./bkk-backend
