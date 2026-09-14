@@ -394,6 +394,72 @@ def health() -> dict:
     }
 
 
+class CurrentDelaysRequest(BaseModel):
+    trip_ids: list[str] = Field(examples=[["BKK_D19380125", "BKK_D20075241"]])
+    service_date: str = Field(examples=["20260914"])
+
+
+class CurrentDelaysResponse(BaseModel):
+    # Keyed by tripId - a trip missing from this dict means "no confirmed
+    # arrival for it yet today" (its very first stop hasn't happened), not
+    # an error; the caller (the map) should render that as "no data yet"
+    # rather than treat it as a failure.
+    delays: dict[str, UpstreamDelayReading]
+
+
+@app.post("/vehicles/current-delays", response_model=CurrentDelaysResponse)
+def vehicles_current_delays(request: CurrentDelaysRequest) -> CurrentDelaysResponse:
+    """
+    The map's real-time coloring feed (added 2026-09-14, at Mustafa's
+    request for a way to *see* delay at a glance instead of only on
+    click) - each vehicle's most recent CONFIRMED delay today, for
+    potentially hundreds of vehicles in one call. Deliberately real
+    ground truth, not a fresh model prediction per vehicle - that would
+    mean running full inference (plus its own DB/weather lookups) for
+    every tracked vehicle on every ~10s map poll, the same cost problem
+    that made per-click prediction lazy in the first place. This is one
+    bulk query instead, cheap enough to run every poll.
+
+    Unlike fetch_upstream_delay (used for a single vehicle's *own*
+    prediction, which deliberately only looks *before* its current stop
+    to avoid leaking the very thing being predicted), this wants the
+    single freshest confirmed observation for the whole trip today,
+    including its current stop if that's already been confirmed
+    STOPPED_AT/100% - there's no prediction to leak into here, just a
+    live status display.
+    """
+    if schedule_lookup is None:
+        raise HTTPException(status_code=503, detail="Schedule not loaded")
+    if not request.trip_ids:
+        return CurrentDelaysResponse(delays={})
+
+    query = """
+        SELECT DISTINCT ON (trip_id) trip_id, stop_sequence, recorded_at
+        FROM vehicle_position_snapshots
+        WHERE trip_id = ANY(%s) AND service_date = %s
+          AND status = 'STOPPED_AT' AND stop_distance_percent = 100
+        ORDER BY trip_id, recorded_at DESC
+    """
+    with psycopg2.connect(**DB_CONFIG) as conn, conn.cursor() as cur:
+        cur.execute(query, (request.trip_ids, request.service_date))
+        rows = cur.fetchall()
+
+    delays: dict[str, UpstreamDelayReading] = {}
+    now = datetime.now(BUDAPEST_TZ)
+    for trip_id, stop_sequence, recorded_at in rows:
+        scheduled = schedule_lookup.scheduled_arrival(
+            trip_id.removeprefix("BKK_"), stop_sequence, request.service_date
+        )
+        if scheduled is None:
+            continue
+        recorded_at = recorded_at.astimezone(BUDAPEST_TZ)
+        delays[trip_id] = UpstreamDelayReading(
+            delay_seconds=(recorded_at - scheduled).total_seconds(),
+            minutes_ago=(now - recorded_at).total_seconds() / 60,
+        )
+    return CurrentDelaysResponse(delays=delays)
+
+
 @app.post("/predict", response_model=DelayPredictionResponse)
 def predict(request: DelayPredictionRequest) -> DelayPredictionResponse:
     if model is None:

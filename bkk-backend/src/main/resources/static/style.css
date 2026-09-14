@@ -27,3 +27,23 @@ html, body, #map {
 #scoreboard.hidden {
     display: none;
 }
+
+/* Delay-color legend (see app.js renderLegend) - bottom-left, clear of
+   Leaflet's own zoom control (top-left) and attribution (bottom-right). */
+#legend {
+    position: absolute;
+    bottom: 20px;
+    left: 10px;
+    z-index: 1000;
+    background: white;
+    padding: 8px 12px;
+    border-radius: 4px;
+    box-shadow: 0 1px 5px rgba(0, 0, 0, 0.4);
+    font-family: sans-serif;
+    font-size: 13px;
+    line-height: 1.6;
+}
+
+#legend.hidden {
+    display: none;
+}

@@ -33,6 +33,36 @@ function colorFor(routeType) {
     return ROUTE_TYPE_COLORS[routeType] ?? DEFAULT_COLOR;
 }
 
+// Color scale for real-time delay severity (added 2026-09-14) - replaces
+// vehicle-type as the map's primary, at-a-glance color signal, since
+// delay is the actual point of this project and it was previously only
+// visible one click at a time. Vehicle type is still in every popup, just
+// not glanceable anymore - a deliberate trade-off. Discrete buckets
+// rather than a continuous gradient: easier to read at a glance across
+// hundreds of small dots, and easier to build a legible legend for.
+const DELAY_COLOR_BUCKETS = [
+    { max: -30, color: "#2980b9", label: "Early (30s+)" },
+    { max: 60, color: "#27ae60", label: "On time" },
+    { max: 180, color: "#f1c40f", label: "Minor delay (1-3 min)" },
+    { max: 360, color: "#e67e22", label: "Moderate delay (3-6 min)" },
+    { max: Infinity, color: "#e74c3c", label: "Severe delay (6+ min)" },
+];
+const NO_DELAY_DATA_COLOR = "#95a5a6";
+
+function delayColor(delaySeconds) {
+    if (delaySeconds == null) {
+        return NO_DELAY_DATA_COLOR;
+    }
+    const bucket = DELAY_COLOR_BUCKETS.find((b) => delaySeconds < b.max);
+    return bucket.color;
+}
+
+// Keyed by tripId, matching the /current-delays response's own keying -
+// refreshed once per vehicle poll (see refreshDelayColors), not per
+// popup click. A tripId missing from this map means "no confirmed
+// arrival yet today", not an error.
+let currentDelaysByTripId = new Map();
+
 // Keyed by the real-time routeId format ("BKK_" + static route_id, same
 // prefix convention as tripId/stopId) so lookups from vehicle data need no
 // extra string surgery at use-site. Loaded once on page load - routes.txt
@@ -210,7 +240,11 @@ function updateMarkers(vehicles) {
     for (const vehicle of vehicles) {
         seenIds.add(vehicle.vehicleId);
         vehiclesById.set(vehicle.vehicleId, vehicle);
-        const color = colorFor(vehicle.vehicleRouteType);
+        // Uses last poll's delay data until refreshDelayColors (called
+        // right after this function, see refreshVehicles) gets this
+        // poll's fresh numbers back - briefly a poll stale, close enough
+        // given delay doesn't swing wildly in 10s.
+        const color = delayColor(currentDelaysByTripId.get(vehicle.tripId)?.delaySeconds);
         const existing = markersById.get(vehicle.vehicleId);
 
         if (existing) {
@@ -247,16 +281,60 @@ function updateMarkers(vehicles) {
     }
 }
 
+// One bulk call per poll for every tracked vehicle's real-time delay
+// color, not one call per vehicle - see main.py's /vehicles/current-delays
+// docstring for the cost reasoning (same one that made per-click
+// prediction lazy in the first place).
+function refreshDelayColors(vehicles) {
+    const tripIds = vehicles.map((v) => v.tripId).filter(Boolean);
+    const serviceDate = vehicles.find((v) => v.serviceDate)?.serviceDate;
+    if (tripIds.length === 0 || !serviceDate) {
+        return;
+    }
+
+    fetch("/api/vehicles/current-delays", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ tripIds, serviceDate }),
+    })
+        .then((response) => response.json())
+        .then((delays) => {
+            currentDelaysByTripId = new Map(Object.entries(delays));
+            for (const vehicle of vehicles) {
+                const marker = markersById.get(vehicle.vehicleId);
+                if (!marker) continue;
+                const color = delayColor(currentDelaysByTripId.get(vehicle.tripId)?.delaySeconds);
+                marker.setStyle({ color, fillColor: color });
+            }
+        })
+        .catch((error) => console.error("Failed to fetch current delays", error));
+}
+
 function refreshVehicles() {
     const url = `/api/vehicles?lat=${CENTER[0]}&lon=${CENTER[1]}&radius=${RADIUS_METERS}`;
     fetch(url)
         .then((response) => response.json())
-        .then(updateMarkers)
+        .then((vehicles) => {
+            updateMarkers(vehicles);
+            refreshDelayColors(vehicles);
+        })
         .catch((error) => console.error("Failed to fetch vehicles", error));
 }
 
 loadRoutes().then(refreshVehicles);
 setInterval(refreshVehicles, POLL_INTERVAL_MS);
+
+// Static legend for the delay color scale above - rendered once, not
+// polled (the scale itself never changes).
+function renderLegend() {
+    const el = document.getElementById("legend");
+    const swatch = (color) => `<span style="display:inline-block;width:10px;height:10px;background:${color};margin-right:6px;border-radius:2px;"></span>`;
+    const rows = DELAY_COLOR_BUCKETS.map((b) => `${swatch(b.color)}${b.label}<br>`).join("");
+    el.innerHTML = `<strong>Delay</strong><br>${rows}${swatch(NO_DELAY_DATA_COLOR)}No data yet`;
+    el.classList.remove("hidden");
+}
+
+renderLegend();
 
 // Live accuracy scoreboard - reconciles predictions already made against
 // what actually happened (see PredictionScoreboard on the Java side).

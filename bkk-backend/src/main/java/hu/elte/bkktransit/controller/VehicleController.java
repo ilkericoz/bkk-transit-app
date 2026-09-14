@@ -1,5 +1,7 @@
 package hu.elte.bkktransit.controller;
 
+import hu.elte.bkktransit.service.CurrentDelay;
+import hu.elte.bkktransit.service.CurrentDelaysRequest;
 import hu.elte.bkktransit.service.DelayPredictionClient;
 import hu.elte.bkktransit.service.DelayPredictionRequest;
 import hu.elte.bkktransit.service.DelayPredictionResult;
@@ -14,6 +16,7 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.util.List;
+import java.util.Map;
 
 @RestController
 @RequestMapping("/api/vehicles")
@@ -60,5 +63,17 @@ public class VehicleController {
     @GetMapping("/prediction-scoreboard")
     public PredictionScoreboard predictionScoreboard() {
         return delayPredictionClient.scoreboard();
+    }
+
+    // POST /api/vehicles/current-delays - the map's real-time coloring
+    // feed (added 2026-09-14): every tracked vehicle's most recent
+    // CONFIRMED delay, in one batch call per poll. Deliberately real
+    // ground truth rather than a fresh model prediction per vehicle -
+    // that would mean full inference (plus its own DB/weather lookups)
+    // for every vehicle on every ~10s poll, the same cost problem that
+    // made per-click prediction lazy in the first place.
+    @PostMapping("/current-delays")
+    public Map<String, CurrentDelay> currentDelays(@RequestBody CurrentDelaysRequest request) {
+        return delayPredictionClient.currentDelays(request.tripIds(), request.serviceDate());
     }
 }

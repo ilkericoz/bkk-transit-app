@@ -9,6 +9,8 @@ import org.springframework.web.client.RestClient;
 
 import java.net.http.HttpClient;
 import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
 
 /**
  * Talks to the Python/FastAPI delay-prediction sidecar (stage 5) — the
@@ -143,5 +145,36 @@ public class DelayPredictionClient {
                         e.actualDelaySeconds(), e.errorSeconds(), e.predictedAt()))
                 .toList();
         return new PredictionScoreboard(response.reconciledCount(), response.meanAbsoluteErrorSeconds(), recent);
+    }
+
+    private record UpstreamCurrentDelaysRequest(
+            @JsonProperty("trip_ids") List<String> tripIds,
+            @JsonProperty("service_date") String serviceDate
+    ) {
+    }
+
+    private record UpstreamCurrentDelaysResponse(
+            @JsonProperty("delays") Map<String, UpstreamDelayReading> delays
+    ) {
+    }
+
+    /**
+     * Each vehicle's most recent CONFIRMED delay today, for potentially
+     * hundreds of vehicles in one call - the map's real-time coloring feed
+     * (added 2026-09-14). A tripId absent from the returned map means "no
+     * confirmed arrival for it yet today," not an error - the caller
+     * should render that as "no data yet," not a failure.
+     */
+    public Map<String, CurrentDelay> currentDelays(List<String> tripIds, String serviceDate) {
+        UpstreamCurrentDelaysResponse response = restClient.post()
+                .uri("/vehicles/current-delays")
+                .body(new UpstreamCurrentDelaysRequest(tripIds, serviceDate))
+                .retrieve()
+                .body(UpstreamCurrentDelaysResponse.class);
+
+        return response.delays().entrySet().stream()
+                .collect(Collectors.toMap(
+                        Map.Entry::getKey,
+                        e -> new CurrentDelay(e.getValue().delaySeconds(), e.getValue().minutesAgo())));
     }
 }
