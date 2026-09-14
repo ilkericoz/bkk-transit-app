@@ -29,7 +29,7 @@ import psycopg2
 import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from gtfs_schedule import GTFS_DIR, ScheduleLookup
+from gtfs_schedule import BUDAPEST_TZ, GTFS_DIR, ScheduleLookup
 
 GOOGLE_API_KEY = os.environ["GOOGLE_MAPS_API_KEY"]
 BACKEND_BASE_URL = os.environ.get("BACKEND_BASE_URL", "http://localhost:8080")
@@ -47,6 +47,18 @@ MAX_SAMPLES_PER_RUN = 15  # keeps each run's Google API usage small and predicta
 # ride clearly the faster option, which is what actually makes this a
 # meaningful "same trip, same question" comparison.
 LOOKAHEAD_STOPS = 5
+
+# The origin is anchored to a stop the vehicle has already DEPARTED, not
+# its live GPS position - found empirically (2026-09-14) that querying
+# from a live point with departureTime="now" let Google's engine assume a
+# fresh rider starting from scratch, who it might route onto a *later*
+# departure of the same line than the one actually being ridden (its
+# arrivalTime reflected a totally different, much-delayed-looking service
+# instance - not a real accuracy gap, just the wrong question). Anchoring
+# to a real stop with that specific trip's actual scheduled departure time
+# poses Google a well-defined "if someone boards *this* service at *this*
+# time" question instead.
+ORIGIN_LOOKBACK_STOPS = 1
 
 DB_CONFIG = {
     "host": os.environ.get("DB_HOST", "localhost"),
@@ -144,7 +156,8 @@ GOOGLE_TRAVEL_MODES_BY_VEHICLE_TYPE = {
 
 
 def query_google_transit_eta(
-    origin_lat: float, origin_lon: float, dest_lat: float, dest_lon: float, vehicle_route_type: str | None = None
+    origin_lat: float, origin_lon: float, dest_lat: float, dest_lon: float,
+    departure_time: datetime, vehicle_route_type: str | None = None,
 ) -> list[dict]:
     """
     Returns the transitDetails of every transit leg/step in Google's chosen
@@ -154,13 +167,19 @@ def query_google_transit_eta(
     Google is free to suggest a completely different way to get there
     (see GOOGLE_TRAVEL_MODES_BY_VEHICLE_TYPE above for the one thing that
     can be constrained).
+
+    departure_time is the origin stop's actual scheduled departure for the
+    specific trip being tracked (see ORIGIN_LOOKBACK_STOPS above) - not
+    "now". TRANSIT departureTime accepts up to 7 days in the past, which
+    comfortably covers "a few minutes ago" for a stop the vehicle already
+    departed.
     """
-    departure_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    departure_time_str = departure_time.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     body = {
         "origin": {"location": {"latLng": {"latitude": origin_lat, "longitude": origin_lon}}},
         "destination": {"location": {"latLng": {"latitude": dest_lat, "longitude": dest_lon}}},
         "travelMode": "TRANSIT",
-        "departureTime": departure_time,
+        "departureTime": departure_time_str,
     }
     allowed_modes = GOOGLE_TRAVEL_MODES_BY_VEHICLE_TYPE.get(vehicle_route_type)
     if allowed_modes:
@@ -202,6 +221,61 @@ def fetch_our_prediction(trip_id: str, route_id: str, stop_id: str, vehicle_rout
     resp.raise_for_status()
     result = resp.json()
     return result["predictedDelaySeconds"] if result.get("available") else None
+
+
+def fetch_actual_departure(trip_id: str, stop_sequence: int, service_date: str) -> datetime | None:
+    """
+    The REAL observed departure time for this trip's origin anchor stop,
+    if we've already tracked it today - preferred over the static
+    schedule's departure_time when available. Found necessary empirically
+    (2026-09-14): a trip with a scheduled layover/recovery gap between two
+    stops can have a departure_time meaningfully later than when the real
+    vehicle actually left (one sample's "scheduled" departure was 9
+    minutes *after* the query was even made) - anchoring to the schedule
+    there quietly asks Google about the wrong moment, the same class of
+    bug ORIGIN_LOOKBACK_STOPS was introduced to fix, just from the
+    opposite direction. Same query shape as main.py's fetch_upstream_delay.
+    """
+    query = """
+        SELECT MIN(recorded_at) AS recorded_at
+        FROM vehicle_position_snapshots
+        WHERE trip_id = %s AND stop_sequence = %s AND service_date = %s
+          AND status = 'STOPPED_AT' AND stop_distance_percent = 100
+    """
+    with psycopg2.connect(**DB_CONFIG) as conn, conn.cursor() as cur:
+        cur.execute(query, (trip_id, stop_sequence, service_date))
+        row = cur.fetchone()
+    return row[0] if row and row[0] is not None else None
+
+
+def resolve_origin_anchor(
+    schedule_lookup: ScheduleLookup, stops_static: pd.DataFrame, gtfs_trip_id: str, live_trip_id: str,
+    current_stop_sequence: int, service_date: str,
+) -> tuple[tuple[float, float], datetime] | None:
+    """
+    A stop this trip has already DEPARTED, with the best departure time
+    available for it - the REAL observed one if we've already tracked
+    this trip reaching it today, else the static schedule's as a fallback
+    (see fetch_actual_departure for why real beats scheduled here). None
+    if no earlier stop resolves at all (e.g. the vehicle is still
+    approaching its trip's very first stop) or that stop has no
+    coordinates.
+    """
+    origin_stop_sequence = current_stop_sequence - ORIGIN_LOOKBACK_STOPS
+    if origin_stop_sequence < 0:
+        return None
+    origin_stop_id = schedule_lookup.stop_id_at(gtfs_trip_id, origin_stop_sequence)
+    if origin_stop_id is None or origin_stop_id not in stops_static.index:
+        return None
+    departure = fetch_actual_departure(live_trip_id, origin_stop_sequence, service_date)
+    if departure is not None:
+        departure = departure.astimezone(BUDAPEST_TZ)
+    else:
+        departure = schedule_lookup.scheduled_departure(gtfs_trip_id, origin_stop_sequence, service_date)
+    if departure is None:
+        return None
+    row = stops_static.loc[origin_stop_id]
+    return (row["stop_lat"], row["stop_lon"]), departure
 
 
 def resolve_lookahead_target(
@@ -253,6 +327,15 @@ def main() -> None:
                 skipped += 1
                 continue
 
+            origin = resolve_origin_anchor(
+                schedule_lookup, stops_static, gtfs_trip_id, vehicle["tripId"],
+                vehicle["stopSequence"], vehicle["serviceDate"],
+            )
+            if origin is None:
+                skipped += 1
+                continue
+            origin_coords, origin_departure = origin
+
             target = resolve_lookahead_target(schedule_lookup, stops_static, gtfs_trip_id, vehicle["stopSequence"])
             if target is None:
                 skipped += 1
@@ -260,7 +343,7 @@ def main() -> None:
             target_stop_sequence, target_stop_id, dest_coords = target
 
             transit_steps = query_google_transit_eta(
-                vehicle["lat"], vehicle["lon"], *dest_coords, vehicle_route_type=vehicle["vehicleRouteType"]
+                *origin_coords, *dest_coords, origin_departure, vehicle_route_type=vehicle["vehicleRouteType"]
             )
             matching_step = next(
                 (s for s in transit_steps if s.get("transitLine", {}).get("nameShort") == our_route_short_name),

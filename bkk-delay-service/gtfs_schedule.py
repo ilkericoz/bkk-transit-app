@@ -59,9 +59,10 @@ class ScheduleLookup:
     """
 
     def __init__(self):
-        usecols = ["trip_id", "stop_id", "stop_sequence", "arrival_time"]
+        usecols = ["trip_id", "stop_id", "stop_sequence", "arrival_time", "departure_time"]
         df = pd.read_csv(
-            STOP_TIMES_PATH, usecols=usecols, dtype={"trip_id": str, "stop_id": str, "arrival_time": str}
+            STOP_TIMES_PATH, usecols=usecols,
+            dtype={"trip_id": str, "stop_id": str, "arrival_time": str, "departure_time": str},
         )
         df["stop_sequence"] = df["stop_sequence"].astype(int)
         # trip_id + stop_sequence together uniquely identify one scheduled
@@ -71,6 +72,12 @@ class ScheduleLookup:
         # would carry.
         indexed = df.set_index(["trip_id", "stop_sequence"]).sort_index()
         self._by_key = indexed["arrival_time"]
+        # departure_time (added 2026-09-14, for the Google benchmark
+        # sampler's anchored-origin need - see scheduled_departure) - kept
+        # as its own column rather than reusing arrival_time, since the two
+        # genuinely differ at timepoints with a scheduled layover (buses
+        # holding to stay on schedule), even though they're usually equal.
+        self._departure_by_key = indexed["departure_time"]
         # stop_id (added 2026-09-14, for the Google benchmark sampler's
         # look-further-ahead-than-one-stop need) - the *static* GTFS
         # stop_id, not the live feed's "BKK_"+stop_code value; callers that
@@ -90,6 +97,17 @@ class ScheduleLookup:
         if arrival_time is None:
             return None
         return to_scheduled_datetime(service_date, arrival_time)
+
+    def scheduled_departure(self, gtfs_trip_id: str, stop_sequence: int, service_date: str) -> datetime | None:
+        """Same as scheduled_arrival but for departure_time - used to
+        anchor the Google benchmark sampler's query to a specific real
+        service's actual departure from an origin stop, rather than "now"
+        from an arbitrary live GPS point (see google_benchmark_sampler.py
+        for why that distinction turned out to matter)."""
+        departure_time = self._lookup(self._departure_by_key, gtfs_trip_id, stop_sequence)
+        if departure_time is None:
+            return None
+        return to_scheduled_datetime(service_date, departure_time)
 
     def stop_id_at(self, gtfs_trip_id: str, stop_sequence: int) -> str | None:
         """The static stop_id scheduled at this (trip_id, stop_sequence) -
