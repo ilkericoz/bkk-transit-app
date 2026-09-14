@@ -177,6 +177,34 @@ def build_dataset() -> pd.DataFrame:
     merged["has_upstream_delay"] = merged["upstream_delay_seconds"].notna().astype(int)
     merged["upstream_delay_seconds"] = merged["upstream_delay_seconds"].fillna(0.0)
 
+    # route_recent_delay_seconds/has_route_recent_delay (added 2026-09-14):
+    # unlike upstream_delay_seconds (this SAME trip's own recent history),
+    # this is "how are OTHER vehicles on this route doing right now" - a
+    # live signal that exists even for a trip's very first observed stop,
+    # exactly the ~7% of rows (has_upstream_delay=0) upstream_delay can't
+    # help with. Computed via 10-minute time buckets per route rather than
+    # a per-row nearest-other-vehicle search (which would be far slower
+    # over 6M+ rows) - each row looks at the *previous* bucket's average
+    # delay for its route, so it only ever uses genuinely earlier
+    # observations, never data from its own time window.
+    merged["time_bucket"] = merged["actual_arrival"].dt.floor("10min")
+    bucket_stats = (
+        merged.groupby(["route_id", "time_bucket"])["delay_seconds"]
+        .agg(["mean", "count"])
+        .reset_index()
+        .sort_values(["route_id", "time_bucket"])
+    )
+    bucket_stats["route_recent_delay_seconds"] = bucket_stats.groupby("route_id")["mean"].shift(1)
+    bucket_stats["route_recent_delay_count"] = bucket_stats.groupby("route_id")["count"].shift(1)
+
+    merged = merged.merge(
+        bucket_stats[["route_id", "time_bucket", "route_recent_delay_seconds", "route_recent_delay_count"]],
+        on=["route_id", "time_bucket"],
+        how="left",
+    )
+    merged["has_route_recent_delay"] = (merged["route_recent_delay_count"].fillna(0) > 0).astype(int)
+    merged["route_recent_delay_seconds"] = merged["route_recent_delay_seconds"].fillna(0.0)
+
     # Weather (added 2026-09-14): backfilled once for the whole date range
     # this dataset spans, joined by hour against scheduled_arrival (what the
     # weather was like around when this trip was *supposed* to happen, not
@@ -200,6 +228,7 @@ def build_dataset() -> pd.DataFrame:
         "gtfs_trip_id", "route_id", "vehicle_route_type", "stop_id", "stop_sequence",
         "service_date", "scheduled_arrival", "actual_arrival", "delay_seconds",
         "upstream_delay_seconds", "has_upstream_delay",
+        "route_recent_delay_seconds", "has_route_recent_delay",
         "temperature_2m", "precipitation", "wind_speed_10m",
     ]].rename(columns={"gtfs_trip_id": "trip_id"})
 

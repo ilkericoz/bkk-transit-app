@@ -23,7 +23,7 @@ same way.
 
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -100,6 +100,11 @@ class DelayPredictionRequest(BaseModel):
     # available" (has_upstream_delay=False), same as a trip's first stop.
     upstream_delay_seconds: float = 0.0
     has_upstream_delay: bool = False
+    # Optional, same reasoning: this endpoint has no route_id-wide live
+    # context to look up on its own. Defaults to "no reading" like a quiet
+    # route with nothing else currently running.
+    route_recent_delay_seconds: float = 0.0
+    has_route_recent_delay: bool = False
     # Optional, same reasoning as upstream_delay_seconds above: this
     # endpoint has no inherent "now", so it can't assume current weather is
     # right for whatever scheduled_arrival was passed in. Left unset,
@@ -174,6 +179,46 @@ def fetch_upstream_delay(gtfs_trip_id: str, stop_sequence: int, service_date: st
     return (recorded_at - scheduled).total_seconds(), True
 
 
+ROUTE_RECENT_WINDOW_MINUTES = 10  # matches build_delay_dataset.py's bucket size
+
+
+def fetch_route_recent_delay(route_id: str, exclude_trip_id: str) -> tuple[float, bool]:
+    """
+    How OTHER vehicles on this same route have been running in roughly the
+    last ROUTE_RECENT_WINDOW_MINUTES - the live equivalent of
+    build_delay_dataset.py's route_recent_delay_seconds bucket average, and
+    the one that actually helps a trip's very first observed stop, where
+    fetch_upstream_delay (this trip's OWN history) has nothing to report
+    yet. exclude_trip_id keeps this genuinely about *other* vehicles rather
+    than accidentally re-reading the same trip's own upstream stop.
+    """
+    window_end = datetime.now(BUDAPEST_TZ)
+    window_start = window_end - timedelta(minutes=ROUTE_RECENT_WINDOW_MINUTES)
+
+    query = """
+        SELECT trip_id, stop_sequence, service_date, recorded_at
+        FROM vehicle_position_snapshots
+        WHERE route_id = %s
+          AND status = 'STOPPED_AT'
+          AND stop_distance_percent = 100
+          AND recorded_at >= %s AND recorded_at < %s
+          AND trip_id != %s
+    """
+    with psycopg2.connect(**DB_CONFIG) as conn, conn.cursor() as cur:
+        cur.execute(query, (route_id, window_start, window_end, exclude_trip_id))
+        rows = cur.fetchall()
+
+    delays = []
+    for trip_id, stop_sequence, service_date, recorded_at in rows:
+        scheduled = schedule_lookup.scheduled_arrival(trip_id.removeprefix("BKK_"), stop_sequence, service_date)
+        if scheduled is not None:
+            delays.append((recorded_at.astimezone(BUDAPEST_TZ) - scheduled).total_seconds())
+
+    if not delays:
+        return 0.0, False
+    return sum(delays) / len(delays), True
+
+
 @app.get("/health")
 def health() -> dict:
     try:
@@ -209,6 +254,8 @@ def predict(request: DelayPredictionRequest) -> DelayPredictionResponse:
         day_of_week=arrival.weekday(),
         upstream_delay_seconds=request.upstream_delay_seconds,
         has_upstream_delay=int(request.has_upstream_delay),
+        route_recent_delay_seconds=request.route_recent_delay_seconds,
+        has_route_recent_delay=int(request.has_route_recent_delay),
         temperature_2m=request.temperature_2m if request.temperature_2m is not None else weather["temperature_2m"],
         precipitation=request.precipitation if request.precipitation is not None else weather["precipitation"],
         wind_speed_10m=request.wind_speed_10m if request.wind_speed_10m is not None else weather["wind_speed_10m"],
@@ -252,6 +299,9 @@ def predict_from_vehicle(request: LiveVehiclePredictionRequest) -> DelayPredicti
     upstream_delay_seconds, has_upstream_delay = fetch_upstream_delay(
         gtfs_trip_id, request.stop_sequence, request.service_date
     )
+    route_recent_delay_seconds, has_route_recent_delay = fetch_route_recent_delay(
+        request.route_id, request.trip_id
+    )
     weather = live_weather.current()
 
     predicted_delay = model.predict_one(
@@ -263,6 +313,8 @@ def predict_from_vehicle(request: LiveVehiclePredictionRequest) -> DelayPredicti
         day_of_week=scheduled_arrival.weekday(),
         upstream_delay_seconds=upstream_delay_seconds,
         has_upstream_delay=int(has_upstream_delay),
+        route_recent_delay_seconds=route_recent_delay_seconds,
+        has_route_recent_delay=int(has_route_recent_delay),
         temperature_2m=weather["temperature_2m"],
         precipitation=weather["precipitation"],
         wind_speed_10m=weather["wind_speed_10m"],

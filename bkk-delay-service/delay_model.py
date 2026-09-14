@@ -50,6 +50,13 @@ CATEGORICAL_FEATURES = ["route_id", "vehicle_route_type", "stop_id"]
 # treating that the same as a confirmed on-time reading would be wrong.
 # See build_delay_dataset.py for how these are computed for training, and
 # main.py's /predict/from-vehicle for the equivalent live lookup.
+# route_recent_delay_seconds/has_route_recent_delay (added 2026-09-14): how
+# OTHER vehicles on this route were running in roughly the last 10 minutes -
+# fills the gap upstream_delay_seconds leaves for a trip's very first
+# observed stop (the ~7% of rows with has_upstream_delay=0), where this
+# trip has no history of its own yet but the route itself might already be
+# running behind.
+#
 # temperature_2m/precipitation/wind_speed_10m (added 2026-09-14): Budapest
 # weather at this stop visit's scheduled hour (see weather.py) - a plausible
 # driver of surface-transport delay (rain slows traffic) that route/stop/
@@ -57,6 +64,7 @@ CATEGORICAL_FEATURES = ["route_id", "vehicle_route_type", "stop_id"]
 # it's raining today specifically.
 NUMERIC_FEATURES = [
     "hour", "day_of_week", "stop_sequence", "upstream_delay_seconds", "has_upstream_delay",
+    "route_recent_delay_seconds", "has_route_recent_delay",
     "temperature_2m", "precipitation", "wind_speed_10m",
 ]
 ALL_FEATURES = CATEGORICAL_FEATURES + NUMERIC_FEATURES
@@ -170,6 +178,8 @@ class GbtDelayModel(BaseDelayModel):
             "stop_sequence": df["stop_sequence"],
             "upstream_delay_seconds": df["upstream_delay_seconds"],
             "has_upstream_delay": df["has_upstream_delay"],
+            "route_recent_delay_seconds": df["route_recent_delay_seconds"],
+            "has_route_recent_delay": df["has_route_recent_delay"],
             "temperature_2m": df["temperature_2m"],
             "precipitation": df["precipitation"],
             "wind_speed_10m": df["wind_speed_10m"],
