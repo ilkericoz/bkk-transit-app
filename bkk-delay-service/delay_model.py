@@ -50,7 +50,15 @@ CATEGORICAL_FEATURES = ["route_id", "vehicle_route_type", "stop_id"]
 # treating that the same as a confirmed on-time reading would be wrong.
 # See build_delay_dataset.py for how these are computed for training, and
 # main.py's /predict/from-vehicle for the equivalent live lookup.
-NUMERIC_FEATURES = ["hour", "day_of_week", "stop_sequence", "upstream_delay_seconds", "has_upstream_delay"]
+# temperature_2m/precipitation/wind_speed_10m (added 2026-09-14): Budapest
+# weather at this stop visit's scheduled hour (see weather.py) - a plausible
+# driver of surface-transport delay (rain slows traffic) that route/stop/
+# time-of-day/upstream-delay alone can't capture, since none of those know
+# it's raining today specifically.
+NUMERIC_FEATURES = [
+    "hour", "day_of_week", "stop_sequence", "upstream_delay_seconds", "has_upstream_delay",
+    "temperature_2m", "precipitation", "wind_speed_10m",
+]
 ALL_FEATURES = CATEGORICAL_FEATURES + NUMERIC_FEATURES
 TARGET = "delay_seconds"
 
@@ -162,6 +170,9 @@ class GbtDelayModel(BaseDelayModel):
             "stop_sequence": df["stop_sequence"],
             "upstream_delay_seconds": df["upstream_delay_seconds"],
             "has_upstream_delay": df["has_upstream_delay"],
+            "temperature_2m": df["temperature_2m"],
+            "precipitation": df["precipitation"],
+            "wind_speed_10m": df["wind_speed_10m"],
             "route_id_mean_delay": df["route_id"].map(self.route_mean_delay).fillna(self.global_mean_delay),
             "stop_id_mean_delay": df["stop_id"].map(self.stop_mean_delay).fillna(self.global_mean_delay),
         })

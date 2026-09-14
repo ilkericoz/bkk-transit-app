@@ -3,3 +3,4 @@ psycopg2-binary
 scikit-learn
 fastapi
 uvicorn[standard]
+requests

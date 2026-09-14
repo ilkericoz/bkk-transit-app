@@ -34,6 +34,7 @@ import psycopg2
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from gtfs_schedule import BUDAPEST_TZ, STOP_TIMES_PATH, to_scheduled_datetime
+from weather import fetch_historical_hourly
 
 # Rows beyond this are dropped as outliers, not delay. Investigated a batch
 # of these by hand (2026-08-29, ~107k rows): the extreme ones aren't random
@@ -176,10 +177,30 @@ def build_dataset() -> pd.DataFrame:
     merged["has_upstream_delay"] = merged["upstream_delay_seconds"].notna().astype(int)
     merged["upstream_delay_seconds"] = merged["upstream_delay_seconds"].fillna(0.0)
 
+    # Weather (added 2026-09-14): backfilled once for the whole date range
+    # this dataset spans, joined by hour against scheduled_arrival (what the
+    # weather was like around when this trip was *supposed* to happen, not
+    # when it actually did - the schedule is what a real prediction would
+    # know in advance, so that's the honest join key, same reasoning as
+    # hour/day_of_week being derived from scheduled_arrival in
+    # train_model.py). One historical API call for the whole range rather
+    # than one per row - Open-Meteo's archive endpoint is a single request
+    # for an entire date range, not something worth calling per-row.
+    weather = fetch_historical_hourly(
+        merged["scheduled_arrival"].min().date(),
+        merged["scheduled_arrival"].max().date(),
+    )
+    merged["hour_bucket"] = merged["scheduled_arrival"].dt.floor("h")
+    merged = merged.merge(weather, on="hour_bucket", how="left")
+    missing_weather = merged["temperature_2m"].isna().sum()
+    if missing_weather:
+        print(f"Warning: {missing_weather} rows have no matching weather hour (schedule outside the fetched range?)")
+
     return merged[[
         "gtfs_trip_id", "route_id", "vehicle_route_type", "stop_id", "stop_sequence",
         "service_date", "scheduled_arrival", "actual_arrival", "delay_seconds",
         "upstream_delay_seconds", "has_upstream_delay",
+        "temperature_2m", "precipitation", "wind_speed_10m",
     ]].rename(columns={"gtfs_trip_id": "trip_id"})
 
 

@@ -11,7 +11,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py delay_model.py gtfs_schedule.py ./
+COPY main.py delay_model.py gtfs_schedule.py weather.py ./
 
 # models/ (delay_model.joblib) and data/ are NOT copied in - they're
 # gitignored/regenerable and mounted as volumes by docker-compose.yml

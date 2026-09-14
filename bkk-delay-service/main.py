@@ -33,6 +33,7 @@ from pydantic import BaseModel, Field
 
 from delay_model import BaseDelayModel
 from gtfs_schedule import ScheduleLookup
+from weather import LiveWeather
 
 MODEL_PATH = Path(__file__).resolve().parent / "models" / "delay_model.joblib"
 BUDAPEST_TZ = ZoneInfo("Europe/Budapest")
@@ -61,6 +62,11 @@ model: BaseDelayModel | None = None
 # (tripId, stopSequence, serviceDate) fields, since the Java side never
 # imported stop_times.txt itself (see that endpoint's docstring for why).
 schedule_lookup: ScheduleLookup | None = None
+
+# Cached current-conditions reading (see weather.py) - one instance shared
+# across all requests, not per-request, so its 30-min cache actually saves
+# repeated Open-Meteo calls.
+live_weather = LiveWeather()
 
 
 @asynccontextmanager
@@ -94,6 +100,15 @@ class DelayPredictionRequest(BaseModel):
     # available" (has_upstream_delay=False), same as a trip's first stop.
     upstream_delay_seconds: float = 0.0
     has_upstream_delay: bool = False
+    # Optional, same reasoning as upstream_delay_seconds above: this
+    # endpoint has no inherent "now", so it can't assume current weather is
+    # right for whatever scheduled_arrival was passed in. Left unset,
+    # falls back to actual current conditions (live_weather.current()) -
+    # a reasonable default for a scheduled_arrival that's close to now,
+    # less so for one that's deliberately hypothetical/far off.
+    temperature_2m: float | None = None
+    precipitation: float | None = None
+    wind_speed_10m: float | None = None
 
 
 class DelayPredictionResponse(BaseModel):
@@ -161,11 +176,18 @@ def fetch_upstream_delay(gtfs_trip_id: str, stop_sequence: int, service_date: st
 
 @app.get("/health")
 def health() -> dict:
+    try:
+        current_weather = live_weather.current()
+    except Exception:
+        # A weather-API hiccup shouldn't make the whole health check fail -
+        # this just means no reading has ever succeeded yet.
+        current_weather = None
     return {
         "status": "ok",
         "model_loaded": model is not None,
         "model_type": model.name if model else None,
         "schedule_loaded": schedule_lookup is not None,
+        "current_weather": current_weather,
     }
 
 
@@ -177,6 +199,7 @@ def predict(request: DelayPredictionRequest) -> DelayPredictionResponse:
     arrival = request.scheduled_arrival
     arrival = arrival.replace(tzinfo=BUDAPEST_TZ) if arrival.tzinfo is None else arrival.astimezone(BUDAPEST_TZ)
 
+    weather = live_weather.current()
     predicted_delay = model.predict_one(
         route_id=request.route_id,
         stop_id=request.stop_id,
@@ -186,6 +209,9 @@ def predict(request: DelayPredictionRequest) -> DelayPredictionResponse:
         day_of_week=arrival.weekday(),
         upstream_delay_seconds=request.upstream_delay_seconds,
         has_upstream_delay=int(request.has_upstream_delay),
+        temperature_2m=request.temperature_2m if request.temperature_2m is not None else weather["temperature_2m"],
+        precipitation=request.precipitation if request.precipitation is not None else weather["precipitation"],
+        wind_speed_10m=request.wind_speed_10m if request.wind_speed_10m is not None else weather["wind_speed_10m"],
     )
     return DelayPredictionResponse(predicted_delay_seconds=predicted_delay)
 
@@ -226,6 +252,7 @@ def predict_from_vehicle(request: LiveVehiclePredictionRequest) -> DelayPredicti
     upstream_delay_seconds, has_upstream_delay = fetch_upstream_delay(
         gtfs_trip_id, request.stop_sequence, request.service_date
     )
+    weather = live_weather.current()
 
     predicted_delay = model.predict_one(
         route_id=request.route_id,
@@ -236,5 +263,8 @@ def predict_from_vehicle(request: LiveVehiclePredictionRequest) -> DelayPredicti
         day_of_week=scheduled_arrival.weekday(),
         upstream_delay_seconds=upstream_delay_seconds,
         has_upstream_delay=int(has_upstream_delay),
+        temperature_2m=weather["temperature_2m"],
+        precipitation=weather["precipitation"],
+        wind_speed_10m=weather["wind_speed_10m"],
     )
     return DelayPredictionResponse(predicted_delay_seconds=predicted_delay)
