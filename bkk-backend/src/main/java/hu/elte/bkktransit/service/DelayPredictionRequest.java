@@ -12,6 +12,7 @@ public record DelayPredictionRequest(
         String stopId,
         String vehicleRouteType,
         int stopSequence,
-        String serviceDate
+        String serviceDate,
+        Boolean deviated
 ) {
 }

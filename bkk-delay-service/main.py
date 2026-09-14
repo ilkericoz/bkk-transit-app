@@ -114,6 +114,7 @@ class DelayPredictionRequest(BaseModel):
     temperature_2m: float | None = None
     precipitation: float | None = None
     wind_speed_10m: float | None = None
+    deviated: bool = False
 
 
 class DelayPredictionResponse(BaseModel):
@@ -134,6 +135,7 @@ class LiveVehiclePredictionRequest(BaseModel):
     vehicle_route_type: str = Field(examples=["TRAM"])
     stop_sequence: int = Field(ge=0)
     service_date: str = Field(examples=["20260912"], description="GTFS serviceDate, YYYYMMDD")
+    deviated: bool = False
 
 
 def fetch_upstream_delay(gtfs_trip_id: str, stop_sequence: int, service_date: str) -> tuple[float, bool]:
@@ -259,6 +261,7 @@ def predict(request: DelayPredictionRequest) -> DelayPredictionResponse:
         temperature_2m=request.temperature_2m if request.temperature_2m is not None else weather["temperature_2m"],
         precipitation=request.precipitation if request.precipitation is not None else weather["precipitation"],
         wind_speed_10m=request.wind_speed_10m if request.wind_speed_10m is not None else weather["wind_speed_10m"],
+        deviated=int(request.deviated),
     )
     return DelayPredictionResponse(predicted_delay_seconds=predicted_delay)
 
@@ -318,5 +321,6 @@ def predict_from_vehicle(request: LiveVehiclePredictionRequest) -> DelayPredicti
         temperature_2m=weather["temperature_2m"],
         precipitation=weather["precipitation"],
         wind_speed_10m=weather["wind_speed_10m"],
+        deviated=int(request.deviated),
     )
     return DelayPredictionResponse(predicted_delay_seconds=predicted_delay)

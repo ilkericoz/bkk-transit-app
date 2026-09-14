@@ -164,6 +164,7 @@ function maybeFetchPrediction(vehicle, marker) {
             vehicleRouteType: vehicle.vehicleRouteType,
             stopSequence: vehicle.stopSequence,
             serviceDate: vehicle.serviceDate,
+            deviated: vehicle.deviated ?? false,
         }),
     })
         .then((response) => {

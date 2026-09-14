@@ -65,24 +65,28 @@ DB_CONFIG = {
 
 def fetch_actual_arrivals() -> pd.DataFrame:
     """
-    One row per (trip_id, stop_sequence) actually observed, with the
-    earliest recorded_at among its STOPPED_AT/100% sightings - the first
-    poll that caught the vehicle already parked at the stop is the closest
-    proxy we have to the true arrival instant.
+    One row per (trip_id, stop_sequence) actually observed, from the
+    earliest STOPPED_AT/100% sighting - the first poll that caught the
+    vehicle already parked at the stop is the closest proxy we have to the
+    true arrival instant. DISTINCT ON (rather than GROUP BY + MIN) so
+    `deviated` also comes from that exact earliest row, not an ambiguous
+    aggregate over however many polls caught the vehicle still parked.
     """
     query = """
-        SELECT trip_id,
+        SELECT DISTINCT ON (trip_id, stop_id, stop_sequence, route_id, vehicle_route_type, service_date)
+               trip_id,
                stop_id,
                stop_sequence,
                route_id,
                vehicle_route_type,
                service_date,
-               MIN(recorded_at) AS actual_arrival
+               recorded_at AS actual_arrival,
+               deviated
         FROM vehicle_position_snapshots
         WHERE trip_id IS NOT NULL
           AND status = 'STOPPED_AT'
           AND stop_distance_percent = 100
-        GROUP BY trip_id, stop_id, stop_sequence, route_id, vehicle_route_type, service_date
+        ORDER BY trip_id, stop_id, stop_sequence, route_id, vehicle_route_type, service_date, recorded_at ASC
     """
     with psycopg2.connect(**DB_CONFIG) as conn:
         df = pd.read_sql_query(query, conn)
@@ -224,12 +228,19 @@ def build_dataset() -> pd.DataFrame:
     if missing_weather:
         print(f"Warning: {missing_weather} rows have no matching weather hour (schedule outside the fetched range?)")
 
+    # deviated (added 2026-09-14): BKK's own "this vehicle is off its normal
+    # route" flag - already collected since the 2026-08-28 field audit but
+    # never actually used as a model feature until now. Missing/null (rare)
+    # treated as "not known to be deviated" rather than dropped.
+    merged["deviated"] = merged["deviated"].fillna(False).astype(int)
+
     return merged[[
         "gtfs_trip_id", "route_id", "vehicle_route_type", "stop_id", "stop_sequence",
         "service_date", "scheduled_arrival", "actual_arrival", "delay_seconds",
         "upstream_delay_seconds", "has_upstream_delay",
         "route_recent_delay_seconds", "has_route_recent_delay",
         "temperature_2m", "precipitation", "wind_speed_10m",
+        "deviated",
     ]].rename(columns={"gtfs_trip_id": "trip_id"})
 
 

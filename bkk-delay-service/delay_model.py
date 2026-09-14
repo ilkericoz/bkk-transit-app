@@ -62,10 +62,15 @@ CATEGORICAL_FEATURES = ["route_id", "vehicle_route_type", "stop_id"]
 # driver of surface-transport delay (rain slows traffic) that route/stop/
 # time-of-day/upstream-delay alone can't capture, since none of those know
 # it's raining today specifically.
+# deviated (added 2026-09-14): BKK's own "this vehicle is off its normal
+# route" flag - already collected since the 2026-08-28 field audit but
+# never fed into the model until now, despite being a plausible free delay
+# predictor (a detour is a very direct cause of running late).
 NUMERIC_FEATURES = [
     "hour", "day_of_week", "stop_sequence", "upstream_delay_seconds", "has_upstream_delay",
     "route_recent_delay_seconds", "has_route_recent_delay",
     "temperature_2m", "precipitation", "wind_speed_10m",
+    "deviated",
 ]
 ALL_FEATURES = CATEGORICAL_FEATURES + NUMERIC_FEATURES
 TARGET = "delay_seconds"
@@ -183,6 +188,7 @@ class GbtDelayModel(BaseDelayModel):
             "temperature_2m": df["temperature_2m"],
             "precipitation": df["precipitation"],
             "wind_speed_10m": df["wind_speed_10m"],
+            "deviated": df["deviated"],
             "route_id_mean_delay": df["route_id"].map(self.route_mean_delay).fillna(self.global_mean_delay),
             "stop_id_mean_delay": df["stop_id"].map(self.stop_mean_delay).fillna(self.global_mean_delay),
         })

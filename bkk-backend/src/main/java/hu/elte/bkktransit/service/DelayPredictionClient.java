@@ -53,7 +53,8 @@ public class DelayPredictionClient {
             @JsonProperty("stop_id") String stopId,
             @JsonProperty("vehicle_route_type") String vehicleRouteType,
             @JsonProperty("stop_sequence") int stopSequence,
-            @JsonProperty("service_date") String serviceDate
+            @JsonProperty("service_date") String serviceDate,
+            @JsonProperty("deviated") boolean deviated
     ) {
     }
 
@@ -78,7 +79,8 @@ public class DelayPredictionClient {
     public DelayPredictionResult predict(DelayPredictionRequest request) {
         UpstreamRequest upstreamRequest = new UpstreamRequest(
                 request.tripId(), request.routeId(), request.stopId(),
-                request.vehicleRouteType(), request.stopSequence(), request.serviceDate());
+                request.vehicleRouteType(), request.stopSequence(), request.serviceDate(),
+                Boolean.TRUE.equals(request.deviated()));
 
         try {
             UpstreamResponse response = restClient.post()
