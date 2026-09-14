@@ -58,7 +58,16 @@ public class DelayPredictionClient {
     ) {
     }
 
-    private record UpstreamResponse(@JsonProperty("predicted_delay_seconds") double predictedDelaySeconds) {
+    private record UpstreamResponse(
+            @JsonProperty("predicted_delay_seconds") double predictedDelaySeconds,
+            @JsonProperty("last_confirmed_delay") UpstreamDelayReading lastConfirmedDelay
+    ) {
+    }
+
+    private record UpstreamDelayReading(
+            @JsonProperty("delay_seconds") double delaySeconds,
+            @JsonProperty("minutes_ago") Double minutesAgo
+    ) {
     }
 
     /**
@@ -88,7 +97,11 @@ public class DelayPredictionClient {
                     .body(upstreamRequest)
                     .retrieve()
                     .body(UpstreamResponse.class);
-            return DelayPredictionResult.of(response.predictedDelaySeconds());
+            DelayPredictionResult.LastConfirmedDelay lastConfirmedDelay = response.lastConfirmedDelay() == null
+                    ? null
+                    : new DelayPredictionResult.LastConfirmedDelay(
+                            response.lastConfirmedDelay().delaySeconds(), response.lastConfirmedDelay().minutesAgo());
+            return DelayPredictionResult.of(response.predictedDelaySeconds(), lastConfirmedDelay);
         } catch (HttpClientErrorException.NotFound e) {
             return DelayPredictionResult.unavailable();
         }

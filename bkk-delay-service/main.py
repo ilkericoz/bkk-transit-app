@@ -117,8 +117,29 @@ class DelayPredictionRequest(BaseModel):
     deviated: bool = False
 
 
+class UpstreamDelayReading(BaseModel):
+    """
+    Not just a model feature - also returned to the caller (see
+    DelayPredictionResponse) so the map can show "this vehicle was last
+    confirmed Xs late, Y minutes ago" right next to the prediction for its
+    upcoming stop. Genuine ground truth (an actual observed arrival),
+    unlike the prediction itself - a good sanity-check reference point for
+    someone eyeballing whether a prediction looks reasonable.
+    """
+
+    delay_seconds: float
+    # None for a manually-supplied value (see /predict) - there's no real
+    # "how long ago" for something the caller just typed in, unlike a live
+    # lookup's actual recorded_at.
+    minutes_ago: float | None = None
+
+
 class DelayPredictionResponse(BaseModel):
     predicted_delay_seconds: float
+    # This trip's last CONFIRMED delay (ground truth, not a prediction) -
+    # None for /predict when the caller didn't supply one, or for a trip's
+    # genuinely first observed stop.
+    last_confirmed_delay: UpstreamDelayReading | None = None
 
 
 class LiveVehiclePredictionRequest(BaseModel):
@@ -138,13 +159,14 @@ class LiveVehiclePredictionRequest(BaseModel):
     deviated: bool = False
 
 
-def fetch_upstream_delay(gtfs_trip_id: str, stop_sequence: int, service_date: str) -> tuple[float, bool]:
+def fetch_upstream_delay(gtfs_trip_id: str, stop_sequence: int, service_date: str) -> UpstreamDelayReading | None:
     """
     This trip's own delay at the most recent earlier stop actually observed
     today - the live-lookup equivalent of build_delay_dataset.py's batch
     upstream_delay_seconds (a groupby+shift there; a single targeted query
     here, since a live request only ever needs one trip's answer). See
     delay_model.py's NUMERIC_FEATURES comment for why this feature exists.
+    None means no earlier stop has been observed yet (a trip's first stop).
 
     Opens a fresh connection per call rather than pooling - this endpoint
     is click-triggered from the map (see app.js), not a hot path, so the
@@ -170,15 +192,17 @@ def fetch_upstream_delay(gtfs_trip_id: str, stop_sequence: int, service_date: st
         row = cur.fetchone()
 
     if row is None:
-        return 0.0, False  # this trip's first observed stop - nothing upstream yet.
+        return None  # this trip's first observed stop - nothing upstream yet.
 
     found_stop_sequence, recorded_at = row
     scheduled = schedule_lookup.scheduled_arrival(gtfs_trip_id, found_stop_sequence, service_date)
     if scheduled is None:
-        return 0.0, False
+        return None
 
     recorded_at = recorded_at.astimezone(BUDAPEST_TZ)
-    return (recorded_at - scheduled).total_seconds(), True
+    delay_seconds = (recorded_at - scheduled).total_seconds()
+    minutes_ago = (datetime.now(BUDAPEST_TZ) - recorded_at).total_seconds() / 60
+    return UpstreamDelayReading(delay_seconds=delay_seconds, minutes_ago=minutes_ago)
 
 
 ROUTE_RECENT_WINDOW_MINUTES = 10  # matches build_delay_dataset.py's bucket size
@@ -263,7 +287,12 @@ def predict(request: DelayPredictionRequest) -> DelayPredictionResponse:
         wind_speed_10m=request.wind_speed_10m if request.wind_speed_10m is not None else weather["wind_speed_10m"],
         deviated=int(request.deviated),
     )
-    return DelayPredictionResponse(predicted_delay_seconds=predicted_delay)
+    last_confirmed_delay = (
+        UpstreamDelayReading(delay_seconds=request.upstream_delay_seconds)
+        if request.has_upstream_delay
+        else None
+    )
+    return DelayPredictionResponse(predicted_delay_seconds=predicted_delay, last_confirmed_delay=last_confirmed_delay)
 
 
 @app.post("/predict/from-vehicle", response_model=DelayPredictionResponse)
@@ -299,9 +328,7 @@ def predict_from_vehicle(request: LiveVehiclePredictionRequest) -> DelayPredicti
             detail="No scheduled arrival found for this trip/stop - not on the imported static GTFS schedule",
         )
 
-    upstream_delay_seconds, has_upstream_delay = fetch_upstream_delay(
-        gtfs_trip_id, request.stop_sequence, request.service_date
-    )
+    upstream = fetch_upstream_delay(gtfs_trip_id, request.stop_sequence, request.service_date)
     route_recent_delay_seconds, has_route_recent_delay = fetch_route_recent_delay(
         request.route_id, request.trip_id
     )
@@ -314,8 +341,8 @@ def predict_from_vehicle(request: LiveVehiclePredictionRequest) -> DelayPredicti
         stop_sequence=request.stop_sequence,
         hour=scheduled_arrival.hour,
         day_of_week=scheduled_arrival.weekday(),
-        upstream_delay_seconds=upstream_delay_seconds,
-        has_upstream_delay=int(has_upstream_delay),
+        upstream_delay_seconds=upstream.delay_seconds if upstream else 0.0,
+        has_upstream_delay=int(upstream is not None),
         route_recent_delay_seconds=route_recent_delay_seconds,
         has_route_recent_delay=int(has_route_recent_delay),
         temperature_2m=weather["temperature_2m"],
@@ -323,4 +350,4 @@ def predict_from_vehicle(request: LiveVehiclePredictionRequest) -> DelayPredicti
         wind_speed_10m=weather["wind_speed_10m"],
         deviated=int(request.deviated),
     )
-    return DelayPredictionResponse(predicted_delay_seconds=predicted_delay)
+    return DelayPredictionResponse(predicted_delay_seconds=predicted_delay, last_confirmed_delay=upstream)

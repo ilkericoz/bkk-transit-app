@@ -119,7 +119,22 @@ function predictionLine(vehicle) {
     if (!prediction.available) {
         return "<br>Predicted delay: n/a (not on our imported schedule)";
     }
-    return `<br>Predicted delay: ${Math.round(prediction.predictedDelaySeconds)}s`;
+    return `<br>Predicted delay: ${Math.round(prediction.predictedDelaySeconds)}s` + lastConfirmedLine(prediction);
+}
+
+// Shows the vehicle's last CONFIRMED delay (genuine ground truth - an
+// actual observed arrival at an earlier stop) right next to the
+// prediction above, so it's easy to eyeball whether the prediction looks
+// reasonable given what this vehicle was *actually* doing a moment ago -
+// not a comparison the prediction itself can prove right or wrong (this
+// stop hasn't happened yet), just a sanity-check reference point.
+function lastConfirmedLine(prediction) {
+    const confirmed = prediction.lastConfirmedDelay;
+    if (!confirmed) {
+        return "<br>Last confirmed delay: n/a (first observed stop on this trip)";
+    }
+    const recency = confirmed.minutesAgo != null ? ` (${confirmed.minutesAgo.toFixed(1)} min ago)` : "";
+    return `<br>Last confirmed delay: ${Math.round(confirmed.delaySeconds)}s${recency}`;
 }
 
 function popupHtml(vehicle) {

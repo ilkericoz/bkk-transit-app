@@ -9,13 +9,23 @@ package hu.elte.bkktransit.service;
  * investigation and the 2026-09-12 stale-feed finding) — so it's modeled
  * as a normal response, not an HTTP error the frontend has to branch on.
  */
-public record DelayPredictionResult(boolean available, Double predictedDelaySeconds) {
+public record DelayPredictionResult(boolean available, Double predictedDelaySeconds, LastConfirmedDelay lastConfirmedDelay) {
 
-    public static DelayPredictionResult unavailable() {
-        return new DelayPredictionResult(false, null);
+    /**
+     * This trip's last CONFIRMED delay — genuine ground truth (an actual
+     * observed arrival), not a prediction — shown next to the predicted
+     * delay so the map can display both together for an easy sanity-check
+     * comparison. Null minutesAgo only happens for a manually-supplied
+     * value from the sidecar's /predict testing endpoint, not a live one.
+     */
+    public record LastConfirmedDelay(double delaySeconds, Double minutesAgo) {
     }
 
-    public static DelayPredictionResult of(double predictedDelaySeconds) {
-        return new DelayPredictionResult(true, predictedDelaySeconds);
+    public static DelayPredictionResult unavailable() {
+        return new DelayPredictionResult(false, null, null);
+    }
+
+    public static DelayPredictionResult of(double predictedDelaySeconds, LastConfirmedDelay lastConfirmedDelay) {
+        return new DelayPredictionResult(true, predictedDelaySeconds, lastConfirmedDelay);
     }
 }
