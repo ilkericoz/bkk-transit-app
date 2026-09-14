@@ -124,15 +124,48 @@ def fetch_candidate_vehicles() -> list[dict]:
     ]
 
 
-def query_google_transit_eta(origin_lat: float, origin_lon: float, dest_lat: float, dest_lon: float) -> list[dict]:
+# Routes API has no way to force a specific line/route/agency (confirmed
+# against the actual TransitPreferences schema docs, 2026-09-14, after
+# Mustafa asked - not guessed) - allowedTravelModes only filters by broad
+# vehicle-type category. Still worth setting: it stops Google from
+# suggesting a cross-mode alternative (e.g. a bus instead of the tram
+# we're actually tracking), even though it can't guarantee the same
+# numbered line within that category. Google has no distinct trolleybus
+# category - BUS (road-based) is the closest fit.
+GOOGLE_TRAVEL_MODES_BY_VEHICLE_TYPE = {
+    "TRAM": ["LIGHT_RAIL"],
+    "BUS": ["BUS"],
+    "TROLLEYBUS": ["BUS"],
+    "SUBWAY": ["SUBWAY"],
+    "RAIL": ["TRAIN"],
+    "SUBURBAN_RAILWAY": ["TRAIN"],
+    "COACH": ["BUS"],
+}
+
+
+def query_google_transit_eta(
+    origin_lat: float, origin_lon: float, dest_lat: float, dest_lon: float, vehicle_route_type: str | None = None
+) -> list[dict]:
     """
     Returns the transitDetails of every transit leg/step in Google's chosen
     route - usually one, sometimes a transfer chain (bus then metro, seen
     in the initial test call). The caller matches against the specific
     route we're tracking rather than assuming the first/only step is it -
-    Google is free to suggest a completely different way to get there.
+    Google is free to suggest a completely different way to get there
+    (see GOOGLE_TRAVEL_MODES_BY_VEHICLE_TYPE above for the one thing that
+    can be constrained).
     """
     departure_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    body = {
+        "origin": {"location": {"latLng": {"latitude": origin_lat, "longitude": origin_lon}}},
+        "destination": {"location": {"latLng": {"latitude": dest_lat, "longitude": dest_lon}}},
+        "travelMode": "TRANSIT",
+        "departureTime": departure_time,
+    }
+    allowed_modes = GOOGLE_TRAVEL_MODES_BY_VEHICLE_TYPE.get(vehicle_route_type)
+    if allowed_modes:
+        body["transitPreferences"] = {"allowedTravelModes": allowed_modes}
+
     response = requests.post(
         "https://routes.googleapis.com/directions/v2:computeRoutes",
         headers={
@@ -140,12 +173,7 @@ def query_google_transit_eta(origin_lat: float, origin_lon: float, dest_lat: flo
             "X-Goog-Api-Key": GOOGLE_API_KEY,
             "X-Goog-FieldMask": "routes.legs.steps.transitDetails",
         },
-        json={
-            "origin": {"location": {"latLng": {"latitude": origin_lat, "longitude": origin_lon}}},
-            "destination": {"location": {"latLng": {"latitude": dest_lat, "longitude": dest_lon}}},
-            "travelMode": "TRANSIT",
-            "departureTime": departure_time,
-        },
+        json=body,
         timeout=15,
     )
     response.raise_for_status()
@@ -231,7 +259,9 @@ def main() -> None:
                 continue
             target_stop_sequence, target_stop_id, dest_coords = target
 
-            transit_steps = query_google_transit_eta(vehicle["lat"], vehicle["lon"], *dest_coords)
+            transit_steps = query_google_transit_eta(
+                vehicle["lat"], vehicle["lon"], *dest_coords, vehicle_route_type=vehicle["vehicleRouteType"]
+            )
             matching_step = next(
                 (s for s in transit_steps if s.get("transitLine", {}).get("nameShort") == our_route_short_name),
                 None,
