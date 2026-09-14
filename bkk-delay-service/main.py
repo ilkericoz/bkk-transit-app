@@ -343,6 +343,15 @@ def scoreboard() -> Scoreboard:
          AND vs.service_date = pl.service_date
          AND vs.status = 'STOPPED_AT'
          AND vs.stop_distance_percent = 100
+         -- A trip_id + stop_sequence isn't always unique within a service_date:
+         -- BKK's live feed can reuse a trip_id across more than one real dispatch
+         -- of a frequent/looping route on the same day. Without this bound, the
+         -- "earliest matching snapshot" could be an arrival from BEFORE the
+         -- prediction was even made - an outcome the prediction couldn't have
+         -- been "wrong" about, but that still counted as a (huge, nonsensical)
+         -- error. Only an arrival that happened after the prediction counts as
+         -- what the prediction was actually judged against.
+         AND vs.recorded_at > pl.predicted_at
         ORDER BY pl.id, vs.recorded_at ASC
     """
     with psycopg2.connect(**DB_CONFIG) as conn, conn.cursor() as cur:
