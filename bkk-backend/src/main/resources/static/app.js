@@ -78,6 +78,33 @@ function loadRoutes() {
         .catch((error) => console.error("Failed to fetch routes", error));
 }
 
+// Keyed by "BKK_" + stop_id. Tried stop_code first (matching tripId/routeId's
+// own "BKK_" + code convention), but checked it against every currently live
+// vehicle's actual stopId rather than assume the same convention holds here:
+// stop_id resolved 321/338, stop_code only 314/338 - and every stop_code
+// match was already covered by stop_id, i.e. stop_code is a strict subset
+// here, not a better key. Loaded once on page load, same reasoning as
+// routesById (~6k static rows, doesn't change while the page is open).
+let stopsById = new Map();
+
+function loadStops() {
+    return fetch("/api/stops")
+        .then((response) => response.json())
+        .then((stops) => {
+            stopsById = new Map(stops.map((stop) => [`BKK_${stop.stopId}`, stop]));
+        })
+        .catch((error) => console.error("Failed to fetch stops", error));
+}
+
+// Falls back to the raw stopId (e.g. "BKK_F01294") if stops haven't loaded
+// yet, or this particular stop isn't in the static feed - most often a
+// Volánbusz/MÁV-START vehicle BKK's live feed surfaces without owning its
+// schedule (see README's "Known limitations"), same "show something rather
+// than nothing" fallback as routeLabel.
+function stopLabel(stopId) {
+    return stopsById.get(stopId)?.stopName || stopId;
+}
+
 // Falls back to the raw routeId (e.g. "BKK_3020") if routes haven't loaded
 // yet or this particular route isn't in the static feed for some reason -
 // better to show something than nothing.
@@ -117,12 +144,12 @@ function statusLine(vehicle) {
         return "n/a";
     }
     if (vehicle.status === "STOPPED_AT") {
-        return `Stopped at ${vehicle.stopId}`;
+        return `Stopped at ${stopLabel(vehicle.stopId)}`;
     }
     if (vehicle.status === "IN_TRANSIT_TO") {
-        return `En route to ${vehicle.stopId} (${vehicle.stopDistancePercent ?? "?"}%)`;
+        return `En route to ${stopLabel(vehicle.stopId)} (${vehicle.stopDistancePercent ?? "?"}%)`;
     }
-    return `${vehicle.status ?? "n/a"} - ${vehicle.stopId}`;
+    return `${vehicle.status ?? "n/a"} - ${stopLabel(vehicle.stopId)}`;
 }
 
 // Delay predictions are fetched lazily (see maybeFetchPrediction below) -
@@ -321,7 +348,7 @@ function refreshVehicles() {
         .catch((error) => console.error("Failed to fetch vehicles", error));
 }
 
-loadRoutes().then(refreshVehicles);
+Promise.all([loadRoutes(), loadStops()]).then(refreshVehicles);
 setInterval(refreshVehicles, POLL_INTERVAL_MS);
 
 // Static legend for the delay color scale above - rendered once, not
