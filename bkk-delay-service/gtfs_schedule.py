@@ -59,15 +59,24 @@ class ScheduleLookup:
     """
 
     def __init__(self):
-        usecols = ["trip_id", "stop_sequence", "arrival_time"]
-        df = pd.read_csv(STOP_TIMES_PATH, usecols=usecols, dtype={"trip_id": str, "arrival_time": str})
+        usecols = ["trip_id", "stop_id", "stop_sequence", "arrival_time"]
+        df = pd.read_csv(
+            STOP_TIMES_PATH, usecols=usecols, dtype={"trip_id": str, "stop_id": str, "arrival_time": str}
+        )
         df["stop_sequence"] = df["stop_sequence"].astype(int)
         # trip_id + stop_sequence together uniquely identify one scheduled
         # stop visit within one trip (see build_delay_dataset.py's
         # docstring) - indexing by that pair gives fast lookups without the
         # per-entry Python-object overhead a plain dict keyed by 5M+ tuples
         # would carry.
-        self._by_key = df.set_index(["trip_id", "stop_sequence"])["arrival_time"].sort_index()
+        indexed = df.set_index(["trip_id", "stop_sequence"]).sort_index()
+        self._by_key = indexed["arrival_time"]
+        # stop_id (added 2026-09-14, for the Google benchmark sampler's
+        # look-further-ahead-than-one-stop need) - the *static* GTFS
+        # stop_id, not the live feed's "BKK_"+stop_code value; callers that
+        # need to match it back against a live VehiclePosition.stopId must
+        # convert via stops.txt's own stop_id->stop_code column themselves.
+        self._stop_id_by_key = indexed["stop_id"]
 
     def scheduled_arrival(self, gtfs_trip_id: str, stop_sequence: int, service_date: str) -> datetime | None:
         """
@@ -77,13 +86,26 @@ class ScheduleLookup:
         2026-08-28 route-name investigation) or ones running off-schedule -
         not a bug to raise on, the caller is expected to handle it.
         """
+        arrival_time = self._lookup(self._by_key, gtfs_trip_id, stop_sequence)
+        if arrival_time is None:
+            return None
+        return to_scheduled_datetime(service_date, arrival_time)
+
+    def stop_id_at(self, gtfs_trip_id: str, stop_sequence: int) -> str | None:
+        """The static stop_id scheduled at this (trip_id, stop_sequence) -
+        None if that stop_sequence doesn't exist on this trip (e.g. asking
+        further ahead than the trip actually runs)."""
+        return self._lookup(self._stop_id_by_key, gtfs_trip_id, stop_sequence)
+
+    @staticmethod
+    def _lookup(series: pd.Series, gtfs_trip_id: str, stop_sequence: int):
         try:
-            arrival_time = self._by_key.loc[(gtfs_trip_id, stop_sequence)]
+            value = series.loc[(gtfs_trip_id, stop_sequence)]
         except KeyError:
             return None
-        if isinstance(arrival_time, pd.Series):
+        if isinstance(value, pd.Series):
             # Defensive only - trip_id+stop_sequence is expected to be
             # unique in the static feed, but if it ever isn't, take the
             # first match rather than erroring the whole request.
-            arrival_time = arrival_time.iloc[0]
-        return to_scheduled_datetime(service_date, arrival_time)
+            value = value.iloc[0]
+        return value
