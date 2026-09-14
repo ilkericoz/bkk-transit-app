@@ -4,9 +4,21 @@ A real-time public transit tracker and machine-learning delay predictor for Buda
 
 Started as a portfolio project for internship applications; grew into a genuine polyglot microservices system (Java backend, Python ML sidecar, message-queue ingestion pipeline, Docker Compose) with over a million real accumulated vehicle observations behind it.
 
+## Live demo
+
+**Link:** *(paste the current tunnel URL here before sharing — `cloudflared tunnel --url http://localhost:8080`, a fresh one each time it's started)*
+
+A two-minute guided tour, in order:
+
+1. **The map itself** — every BKK vehicle currently running, positions updating every 10 seconds. Dots are colored by *real-time delay severity* (blue → green → yellow → orange → red), not vehicle type — glance at the map and you can already tell which parts of the city are having a rough moment, before clicking anything.
+2. **Click any vehicle** — its predicted delay for the *next* stop, right next to its last *confirmed* delay (real GPS data from a minute ago). The two usually track closely — a visible sign the model is reacting to what this specific vehicle is actually doing right now, not reciting a generic route average.
+3. **Bottom-left legend** — the color scale.
+4. **Top-right "Live model accuracy" panel** — a real, continuously-updating scoreboard: every prediction gets logged, then automatically graded against reality once the vehicle actually reaches that stop. Not a canned demo number — it updates while you watch.
+5. **The one to say out loud:** this model beats Google Maps' own transit ETA on real Budapest trips — **~58s average error vs. Google's ~312s**, closer to the real outcome in **68%** of head-to-head comparisons, verified on 189 real reconciled predictions (see "External validation" below for how that comparison was built and debugged).
+
 ## What it does
 
-- **Live map** — every BKK bus, tram, trolleybus, and suburban rail vehicle currently running, updated every 10 seconds, color-coded by vehicle type.
+- **Live map** — every BKK bus, tram, trolleybus, and suburban rail vehicle currently running, updated every 10 seconds, color-coded by real-time delay severity.
 - **Delay prediction** — click any vehicle to see a predicted delay for its upcoming stop, alongside its last *confirmed* delay (real ground truth) for an easy sanity check.
 - **Live accuracy scoreboard** — a running, continuously-updating measure of how accurate the model's predictions actually turn out to be, reconciled against real outcomes as vehicles reach their stops.
 - **External validation** — every prediction is also benchmarked against Google's own Routes API transit ETA for the same real trip, not just against a dumb internal baseline.
