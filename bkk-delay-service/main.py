@@ -69,6 +69,24 @@ schedule_lookup: ScheduleLookup | None = None
 live_weather = LiveWeather()
 
 
+PREDICTION_LOG_DDL = """
+    CREATE TABLE IF NOT EXISTS prediction_log (
+        id BIGSERIAL PRIMARY KEY,
+        trip_id VARCHAR(255) NOT NULL,
+        stop_id VARCHAR(255) NOT NULL,
+        stop_sequence INTEGER NOT NULL,
+        service_date VARCHAR(255) NOT NULL,
+        route_id VARCHAR(255),
+        vehicle_route_type VARCHAR(255),
+        predicted_delay_seconds DOUBLE PRECISION NOT NULL,
+        model_type VARCHAR(255),
+        predicted_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS idx_prediction_log_lookup
+        ON prediction_log (trip_id, stop_id, stop_sequence, service_date);
+"""
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global model, schedule_lookup
@@ -76,6 +94,15 @@ async def lifespan(app: FastAPI):
         raise RuntimeError(f"No trained model at {MODEL_PATH} - run scripts/train_model.py first.")
     model = BaseDelayModel.load(MODEL_PATH)
     schedule_lookup = ScheduleLookup()
+
+    # Self-provisioning rather than a manual migration step - this table is
+    # this service's own concern (Java's Hibernate ddl-auto=update doesn't
+    # know about it, and shouldn't need to), so the sidecar creates it
+    # itself on startup if it isn't already there.
+    with psycopg2.connect(**DB_CONFIG) as conn, conn.cursor() as cur:
+        cur.execute(PREDICTION_LOG_DDL)
+        conn.commit()
+
     yield
 
 
@@ -245,6 +272,111 @@ def fetch_route_recent_delay(route_id: str, exclude_trip_id: str) -> tuple[float
     return sum(delays) / len(delays), True
 
 
+def log_prediction(
+    trip_id: str, route_id: str, stop_id: str, vehicle_route_type: str,
+    stop_sequence: int, service_date: str, predicted_delay_seconds: float,
+) -> None:
+    """
+    Records a live prediction so /scoreboard can later reconcile it against
+    what actually happened - see prediction_log's DDL above. Only called
+    from /predict/from-vehicle (a real prediction against a genuine future
+    stop visit), not /predict (a manual/testing call that may not even
+    correspond to a real trip).
+    """
+    query = """
+        INSERT INTO prediction_log
+            (trip_id, route_id, stop_id, vehicle_route_type, stop_sequence,
+             service_date, predicted_delay_seconds, model_type)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+    """
+    with psycopg2.connect(**DB_CONFIG) as conn, conn.cursor() as cur:
+        cur.execute(query, (
+            trip_id, route_id, stop_id, vehicle_route_type, stop_sequence,
+            service_date, predicted_delay_seconds, model.name if model else None,
+        ))
+        conn.commit()
+
+
+class ScoreboardEntry(BaseModel):
+    route_id: str | None
+    vehicle_route_type: str | None
+    predicted_delay_seconds: float
+    actual_delay_seconds: float
+    error_seconds: float
+    predicted_at: datetime
+
+
+class Scoreboard(BaseModel):
+    reconciled_count: int
+    mean_absolute_error_seconds: float | None
+    recent: list[ScoreboardEntry]
+
+
+SCOREBOARD_MAE_WINDOW = 50  # how many recent reconciled predictions the headline MAE is averaged over
+SCOREBOARD_RECENT_DISPLAY = 10  # how many of those are actually shown in the list
+
+
+@app.get("/scoreboard", response_model=Scoreboard)
+def scoreboard() -> Scoreboard:
+    """
+    Reconciles logged predictions against what actually happened, computed
+    on read rather than via a background job - prediction_log's volume
+    (bounded by how often someone clicks a vehicle on the map) is small
+    enough that there's no real cost to just joining at request time,
+    which is a lot simpler than maintaining a separate reconciliation
+    process. DISTINCT ON picks the earliest STOPPED_AT/100% sighting per
+    logged prediction, same "first poll that caught it arrived" definition
+    of actual arrival used everywhere else in this project (see
+    build_delay_dataset.py's fetch_actual_arrivals).
+    """
+    query = """
+        SELECT DISTINCT ON (pl.id)
+               pl.id, pl.trip_id, pl.route_id, pl.vehicle_route_type,
+               pl.stop_sequence, pl.service_date,
+               pl.predicted_delay_seconds, pl.predicted_at,
+               vs.recorded_at AS actual_recorded_at
+        FROM prediction_log pl
+        JOIN vehicle_position_snapshots vs
+          ON vs.trip_id = pl.trip_id
+         AND vs.stop_id = pl.stop_id
+         AND vs.stop_sequence = pl.stop_sequence
+         AND vs.service_date = pl.service_date
+         AND vs.status = 'STOPPED_AT'
+         AND vs.stop_distance_percent = 100
+        ORDER BY pl.id, vs.recorded_at ASC
+    """
+    with psycopg2.connect(**DB_CONFIG) as conn, conn.cursor() as cur:
+        cur.execute(query)
+        rows = cur.fetchall()
+
+    entries = []
+    for (_id, trip_id, route_id, vehicle_route_type, stop_sequence, service_date,
+         predicted_delay_seconds, predicted_at, actual_recorded_at) in rows:
+        scheduled = schedule_lookup.scheduled_arrival(trip_id.removeprefix("BKK_"), stop_sequence, service_date)
+        if scheduled is None:
+            continue
+        actual_delay_seconds = (actual_recorded_at.astimezone(BUDAPEST_TZ) - scheduled).total_seconds()
+        entries.append(ScoreboardEntry(
+            route_id=route_id,
+            vehicle_route_type=vehicle_route_type,
+            predicted_delay_seconds=predicted_delay_seconds,
+            actual_delay_seconds=actual_delay_seconds,
+            error_seconds=abs(predicted_delay_seconds - actual_delay_seconds),
+            predicted_at=predicted_at,
+        ))
+
+    entries.sort(key=lambda e: e.predicted_at, reverse=True)
+    for_mae = entries[:SCOREBOARD_MAE_WINDOW]
+    mean_absolute_error = (
+        sum(e.error_seconds for e in for_mae) / len(for_mae) if for_mae else None
+    )
+    return Scoreboard(
+        reconciled_count=len(entries),
+        mean_absolute_error_seconds=mean_absolute_error,
+        recent=entries[:SCOREBOARD_RECENT_DISPLAY],
+    )
+
+
 @app.get("/health")
 def health() -> dict:
     try:
@@ -349,5 +481,10 @@ def predict_from_vehicle(request: LiveVehiclePredictionRequest) -> DelayPredicti
         precipitation=weather["precipitation"],
         wind_speed_10m=weather["wind_speed_10m"],
         deviated=int(request.deviated),
+    )
+    log_prediction(
+        trip_id=request.trip_id, route_id=request.route_id, stop_id=request.stop_id,
+        vehicle_route_type=request.vehicle_route_type, stop_sequence=request.stop_sequence,
+        service_date=request.service_date, predicted_delay_seconds=predicted_delay,
     )
     return DelayPredictionResponse(predicted_delay_seconds=predicted_delay, last_confirmed_delay=upstream)

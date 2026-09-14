@@ -4,6 +4,7 @@ import hu.elte.bkktransit.service.DelayPredictionClient;
 import hu.elte.bkktransit.service.DelayPredictionRequest;
 import hu.elte.bkktransit.service.DelayPredictionResult;
 import hu.elte.bkktransit.service.FutarClient;
+import hu.elte.bkktransit.service.PredictionScoreboard;
 import hu.elte.bkktransit.service.VehiclePosition;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -48,5 +49,16 @@ public class VehicleController {
     @PostMapping("/delay-prediction")
     public DelayPredictionResult delayPrediction(@RequestBody DelayPredictionRequest request) {
         return delayPredictionClient.predict(request);
+    }
+
+    // GET /api/vehicles/prediction-scoreboard - live accuracy stats,
+    // reconciling predictions we've already made against what actually
+    // happened (see PredictionScoreboard). Polled occasionally by the map
+    // page (see app.js) - predictions only reconcile once a vehicle
+    // actually reaches the stop, so there's no benefit to polling this as
+    // often as the 10s vehicle-position refresh.
+    @GetMapping("/prediction-scoreboard")
+    public PredictionScoreboard predictionScoreboard() {
+        return delayPredictionClient.scoreboard();
     }
 }

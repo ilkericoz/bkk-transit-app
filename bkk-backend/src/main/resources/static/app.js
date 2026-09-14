@@ -257,3 +257,50 @@ function refreshVehicles() {
 
 loadRoutes().then(refreshVehicles);
 setInterval(refreshVehicles, POLL_INTERVAL_MS);
+
+// Live accuracy scoreboard - reconciles predictions already made against
+// what actually happened (see PredictionScoreboard on the Java side).
+// Polled far less often than vehicle positions: a prediction only
+// reconciles once the vehicle actually reaches the stop, so refreshing
+// this every 10s like the map would just re-fetch the same few numbers.
+const SCOREBOARD_POLL_INTERVAL_MS = 30000;
+
+function scoreboardHtml(scoreboard) {
+    if (scoreboard.reconciledCount === 0) {
+        return "<strong>Live model accuracy</strong><br>No reconciled predictions yet - click a vehicle to make one, then check back once it reaches its next stop.";
+    }
+    const mae = Math.round(scoreboard.meanAbsoluteErrorSeconds);
+    const windowSize = Math.min(scoreboard.reconciledCount, 50);
+    let html = `<strong>Live model accuracy</strong><br>Avg error (last ${windowSize}): ${mae}s<br>Reconciled so far: ${scoreboard.reconciledCount}`;
+    if (scoreboard.recent.length > 0) {
+        html += "<hr>";
+        for (const entry of scoreboard.recent.slice(0, 5)) {
+            const predicted = Math.round(entry.predictedDelaySeconds);
+            const actual = Math.round(entry.actualDelaySeconds);
+            html += `${routeLabelFor(entry)}: predicted ${predicted}s, actual ${actual}s<br>`;
+        }
+    }
+    return html;
+}
+
+// Separate from routeLabel(vehicle) above since a scoreboard entry isn't
+// shaped like a VehiclePosition (no "BKK_"-prefixed routeId lookup key
+// mismatch to worry about here - routeId already comes through as-is).
+function routeLabelFor(entry) {
+    const route = routesById.get(entry.routeId);
+    return route?.routeShortName || entry.routeId || "n/a";
+}
+
+function refreshScoreboard() {
+    const el = document.getElementById("scoreboard");
+    fetch("/api/vehicles/prediction-scoreboard")
+        .then((response) => response.json())
+        .then((scoreboard) => {
+            el.innerHTML = scoreboardHtml(scoreboard);
+            el.classList.remove("hidden");
+        })
+        .catch((error) => console.error("Failed to fetch prediction scoreboard", error));
+}
+
+refreshScoreboard();
+setInterval(refreshScoreboard, SCOREBOARD_POLL_INTERVAL_MS);

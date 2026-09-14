@@ -8,6 +8,7 @@ import org.springframework.web.client.HttpClientErrorException;
 import org.springframework.web.client.RestClient;
 
 import java.net.http.HttpClient;
+import java.util.List;
 
 /**
  * Talks to the Python/FastAPI delay-prediction sidecar (stage 5) — the
@@ -105,5 +106,42 @@ public class DelayPredictionClient {
         } catch (HttpClientErrorException.NotFound e) {
             return DelayPredictionResult.unavailable();
         }
+    }
+
+    private record UpstreamScoreboardResponse(
+            @JsonProperty("reconciled_count") int reconciledCount,
+            @JsonProperty("mean_absolute_error_seconds") Double meanAbsoluteErrorSeconds,
+            @JsonProperty("recent") List<UpstreamScoreboardEntry> recent
+    ) {
+    }
+
+    private record UpstreamScoreboardEntry(
+            @JsonProperty("route_id") String routeId,
+            @JsonProperty("vehicle_route_type") String vehicleRouteType,
+            @JsonProperty("predicted_delay_seconds") double predictedDelaySeconds,
+            @JsonProperty("actual_delay_seconds") double actualDelaySeconds,
+            @JsonProperty("error_seconds") double errorSeconds,
+            @JsonProperty("predicted_at") String predictedAt
+    ) {
+    }
+
+    /**
+     * Live "how good are we actually doing" stats - see PredictionScoreboard.
+     * A thin proxy, same as everything else here: the sidecar does the
+     * actual reconciliation join, this just reshapes its response into
+     * this codebase's camelCase convention.
+     */
+    public PredictionScoreboard scoreboard() {
+        UpstreamScoreboardResponse response = restClient.get()
+                .uri("/scoreboard")
+                .retrieve()
+                .body(UpstreamScoreboardResponse.class);
+
+        List<PredictionScoreboard.Entry> recent = response.recent().stream()
+                .map(e -> new PredictionScoreboard.Entry(
+                        e.routeId(), e.vehicleRouteType(), e.predictedDelaySeconds(),
+                        e.actualDelaySeconds(), e.errorSeconds(), e.predictedAt()))
+                .toList();
+        return new PredictionScoreboard(response.reconciledCount(), response.meanAbsoluteErrorSeconds(), recent);
     }
 }
