@@ -2,3 +2,4 @@
 # (bkk-backend/.gitignore, bkk-delay-service/.gitignore).
 
 hs_err_pid*.log
+db-backups/

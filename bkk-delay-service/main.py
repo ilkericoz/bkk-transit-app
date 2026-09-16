@@ -86,6 +86,20 @@ PREDICTION_LOG_DDL = """
         ON prediction_log (trip_id, stop_id, stop_sequence, service_date);
 """
 
+# vehicle_position_snapshots is Java's table (Hibernate ddl-auto=update owns
+# its columns), but /scoreboard's join is this service's own query, so the
+# index it needs to not time out is provisioned from here rather than
+# reaching into the Java side's schema management. Only ever grew slow once
+# the table crossed ~100M rows (idx_snapshot_trip_id alone left too much for
+# Postgres to filter row-by-row after the index scan) - IF NOT EXISTS makes
+# this a no-op on an already-patched DB; on a fresh one the table starts
+# empty so a plain (non-CONCURRENTLY) build here is instant either way.
+SCOREBOARD_INDEX_DDL = """
+    CREATE INDEX IF NOT EXISTS idx_snapshot_scoreboard_join
+        ON vehicle_position_snapshots (trip_id, stop_id, stop_sequence, service_date, recorded_at)
+        WHERE status = 'STOPPED_AT' AND stop_distance_percent = 100;
+"""
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -101,6 +115,7 @@ async def lifespan(app: FastAPI):
     # itself on startup if it isn't already there.
     with psycopg2.connect(**DB_CONFIG) as conn, conn.cursor() as cur:
         cur.execute(PREDICTION_LOG_DDL)
+        cur.execute(SCOREBOARD_INDEX_DDL)
         conn.commit()
 
     yield
