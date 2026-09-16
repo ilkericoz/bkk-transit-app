@@ -113,7 +113,7 @@ public class DelayPredictionClient {
     private record UpstreamScoreboardResponse(
             @JsonProperty("reconciled_count") int reconciledCount,
             @JsonProperty("mean_absolute_error_seconds") Double meanAbsoluteErrorSeconds,
-            @JsonProperty("recent") List<UpstreamScoreboardEntry> recent
+            @JsonProperty("best") List<UpstreamScoreboardEntry> best
     ) {
     }
 
@@ -139,12 +139,12 @@ public class DelayPredictionClient {
                 .retrieve()
                 .body(UpstreamScoreboardResponse.class);
 
-        List<PredictionScoreboard.Entry> recent = response.recent().stream()
+        List<PredictionScoreboard.Entry> best = response.best().stream()
                 .map(e -> new PredictionScoreboard.Entry(
                         e.routeId(), e.vehicleRouteType(), e.predictedDelaySeconds(),
                         e.actualDelaySeconds(), e.errorSeconds(), e.predictedAt()))
                 .toList();
-        return new PredictionScoreboard(response.reconciledCount(), response.meanAbsoluteErrorSeconds(), recent);
+        return new PredictionScoreboard(response.reconciledCount(), response.meanAbsoluteErrorSeconds(), best);
     }
 
     private record UpstreamCurrentDelaysRequest(

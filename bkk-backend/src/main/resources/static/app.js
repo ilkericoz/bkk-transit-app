@@ -401,12 +401,16 @@ function scoreboardHtml(scoreboard) {
     if (scoreboard.reconciledCount === 0) {
         return "<strong>Live model accuracy</strong><br>No reconciled predictions yet - click a vehicle to make one, then check back once it reaches its next stop.";
     }
+    // Avg error is all-time (every reconciled prediction, not a rolling
+    // window) - a rolling window shows a different subset each poll as old
+    // entries fall out of it, which reads as the number moving around for
+    // no visible reason. All-time over a large N barely shifts per new
+    // sample, so it's both a truer number and a calmer one to watch.
     const mae = Math.round(scoreboard.meanAbsoluteErrorSeconds);
-    const windowSize = Math.min(scoreboard.reconciledCount, 50);
-    let html = `<strong>Live model accuracy</strong><br>Avg error (last ${windowSize}): ${mae}s<br>Reconciled so far: ${scoreboard.reconciledCount}`;
-    if (scoreboard.recent.length > 0) {
-        html += "<hr>";
-        for (const entry of scoreboard.recent.slice(0, 5)) {
+    let html = `<strong>Live model accuracy</strong><br>Avg error: ${mae}s<br>Reconciled so far: ${scoreboard.reconciledCount}`;
+    if (scoreboard.best.length > 0) {
+        html += "<hr>Closest calls so far:<br>";
+        for (const entry of scoreboard.best) {
             const predicted = Math.round(entry.predictedDelaySeconds);
             const actual = Math.round(entry.actualDelaySeconds);
             html += `${routeLabelFor(entry)}: predicted ${predicted}s, actual ${actual}s<br>`;

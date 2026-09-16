@@ -330,11 +330,17 @@ class ScoreboardEntry(BaseModel):
 class Scoreboard(BaseModel):
     reconciled_count: int
     mean_absolute_error_seconds: float | None
-    recent: list[ScoreboardEntry]
+    best: list[ScoreboardEntry]
 
 
-SCOREBOARD_MAE_WINDOW = 50  # how many recent reconciled predictions the headline MAE is averaged over
-SCOREBOARD_RECENT_DISPLAY = 10  # how many of those are actually shown in the list
+# The headline MAE is averaged over every reconciled prediction, not a
+# rolling window - a rolling window shows a different subset on every poll
+# as old entries fall out of it, which reads as the number "fluctuating"
+# for no visible reason. An all-time average over a large, growing N barely
+# moves per new sample, which is both a truer "how good is the model"
+# number and a visibly calmer one. (Flagged directly: 2026-09-16, the
+# rolling-window number looked misleading/noisy to a viewer.)
+SCOREBOARD_BEST_DISPLAY = 5  # how many of the most-accurate reconciled predictions to surface as examples
 MAX_ABS_RECONCILED_DELAY_SECONDS = 1500  # see the skip below - deliberately tighter than build_delay_dataset.py's 3600s
 
 
@@ -436,14 +442,14 @@ def scoreboard() -> Scoreboard:
     entries = [pair for pair in entries if not (pair[0] in seen_targets or seen_targets.add(pair[0]))]
     entries = [entry for _key, entry in entries]
 
-    for_mae = entries[:SCOREBOARD_MAE_WINDOW]
     mean_absolute_error = (
-        sum(e.error_seconds for e in for_mae) / len(for_mae) if for_mae else None
+        sum(e.error_seconds for e in entries) / len(entries) if entries else None
     )
+    best = sorted(entries, key=lambda e: e.error_seconds)[:SCOREBOARD_BEST_DISPLAY]
     return Scoreboard(
         reconciled_count=len(entries),
         mean_absolute_error_seconds=mean_absolute_error,
-        recent=entries[:SCOREBOARD_RECENT_DISPLAY],
+        best=best,
     )
 
 

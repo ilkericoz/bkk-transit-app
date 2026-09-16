@@ -13,7 +13,7 @@ import java.util.List;
 public record PredictionScoreboard(
         int reconciledCount,
         Double meanAbsoluteErrorSeconds,
-        List<Entry> recent
+        List<Entry> best
 ) {
 
     public record Entry(
