@@ -405,10 +405,14 @@ def scoreboard() -> Scoreboard:
             # value already at 1906.2s, a genuine gap, not an arbitrary cut.
             # Deliberately tighter than build_delay_dataset.py's 3600s (which
             # is calibrated for a multi-million-row *training* corpus, where
-            # a rare true 30-40min disruption is fine to keep) - this is a
-            # 50-sample *live display* instead, where one such value would
-            # dominate the reported average regardless of whether it's a
-            # mismatch or a genuine rare extreme. Direct inspection of the
+            # a rare true 30-40min disruption is fine to keep). This isn't
+            # about window size (mean_absolute_error_seconds is all-time now,
+            # not a 50-sample rolling window, see 2026-09-16's scoreboard
+            # rework) - these are *proven mismatches*, not genuine model
+            # error, so they'd corrupt what the metric means at any sample
+            # count. Still not negligible even averaged over hundreds: one
+            # leftover ~5900s mismatch biases a 350-sample all-time MAE by
+            # roughly 5900/350 =~ 17s. Direct inspection of the
             # two rows this excluded (2026-09-16) found both showed the
             # concrete signature of a mismatch (a multi-dispatch trip_id gap
             # in one case, an implausible schedule join in the other), not
