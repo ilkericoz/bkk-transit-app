@@ -48,6 +48,18 @@ const DELAY_COLOR_BUCKETS = [
     { max: Infinity, color: "#e74c3c", label: "Severe delay (6+ min)" },
 ];
 const NO_DELAY_DATA_COLOR = "#95a5a6";
+// A vehicle with no tripId isn't "waiting for data" - BKK hasn't linked it to
+// any scheduled trip at all, which in practice almost always means it's
+// deadheading (destination sign reads "nem szállít utasokat" / "kocsiszínbe"
+// - not carrying passengers / heading to the depot), not a data gap. Found
+// by tracing individual vehicle_ids in Postgres: ~89% of vehicles ever seen
+// without a tripId also get a real one later the same day - it's the same
+// fleet cycling in and out of service, not a broken subset. Deliberately a
+// much paler, more transparent style than NO_DELAY_DATA_COLOR so these
+// visually recede rather than compete with vehicles actually in service.
+const OUT_OF_SERVICE_COLOR = "#dcdde1";
+const OUT_OF_SERVICE_FILL_OPACITY = 0.35;
+const IN_SERVICE_FILL_OPACITY = 0.8;
 
 function delayColor(delaySeconds) {
     if (delaySeconds == null) {
@@ -55,6 +67,14 @@ function delayColor(delaySeconds) {
     }
     const bucket = DELAY_COLOR_BUCKETS.find((b) => delaySeconds < b.max);
     return bucket.color;
+}
+
+function markerStyleFor(vehicle) {
+    if (!vehicle.tripId) {
+        return { color: OUT_OF_SERVICE_COLOR, fillOpacity: OUT_OF_SERVICE_FILL_OPACITY };
+    }
+    const color = delayColor(currentDelaysByTripId.get(vehicle.tripId)?.delaySeconds);
+    return { color, fillOpacity: IN_SERVICE_FILL_OPACITY };
 }
 
 // Keyed by tripId, matching the /current-delays response's own keying -
@@ -140,6 +160,13 @@ const vehiclesById = new Map();
 // to compute delay, surfaced here as a visible sanity check that the data
 // we're now collecting looks right, not just something living in Postgres.
 function statusLine(vehicle) {
+    if (!vehicle.tripId) {
+        // BKK hasn't linked this vehicle to any scheduled trip - almost
+        // always deadheading (its real destination sign reads "nem szállít
+        // utasokat" / "kocsiszínbe" - not carrying passengers / heading to
+        // the depot), not a tracking error. See OUT_OF_SERVICE_COLOR above.
+        return "Out of service (not carrying passengers)";
+    }
     if (!vehicle.stopId) {
         return "n/a";
     }
@@ -271,19 +298,19 @@ function updateMarkers(vehicles) {
         // right after this function, see refreshVehicles) gets this
         // poll's fresh numbers back - briefly a poll stale, close enough
         // given delay doesn't swing wildly in 10s.
-        const color = delayColor(currentDelaysByTripId.get(vehicle.tripId)?.delaySeconds);
+        const { color, fillOpacity } = markerStyleFor(vehicle);
         const existing = markersById.get(vehicle.vehicleId);
 
         if (existing) {
             existing.setLatLng([vehicle.lat, vehicle.lon]);
-            existing.setStyle({ color, fillColor: color });
+            existing.setStyle({ color, fillColor: color, fillOpacity });
             existing.setPopupContent(popupHtml(vehicle));
         } else {
             const marker = L.circleMarker([vehicle.lat, vehicle.lon], {
                 radius: 6,
                 color,
                 fillColor: color,
-                fillOpacity: 0.8,
+                fillOpacity,
                 weight: 2,
             }).bindPopup(popupHtml(vehicle));
             // Only predict for a vehicle someone actually looked at, and
@@ -330,8 +357,8 @@ function refreshDelayColors(vehicles) {
             for (const vehicle of vehicles) {
                 const marker = markersById.get(vehicle.vehicleId);
                 if (!marker) continue;
-                const color = delayColor(currentDelaysByTripId.get(vehicle.tripId)?.delaySeconds);
-                marker.setStyle({ color, fillColor: color });
+                const { color, fillOpacity } = markerStyleFor(vehicle);
+                marker.setStyle({ color, fillColor: color, fillOpacity });
             }
         })
         .catch((error) => console.error("Failed to fetch current delays", error));
@@ -357,7 +384,7 @@ function renderLegend() {
     const el = document.getElementById("legend");
     const swatch = (color) => `<span style="display:inline-block;width:10px;height:10px;background:${color};margin-right:6px;border-radius:2px;"></span>`;
     const rows = DELAY_COLOR_BUCKETS.map((b) => `${swatch(b.color)}${b.label}<br>`).join("");
-    el.innerHTML = `<strong>Delay</strong><br>${rows}${swatch(NO_DELAY_DATA_COLOR)}No data yet`;
+    el.innerHTML = `<strong>Delay</strong><br>${rows}${swatch(NO_DELAY_DATA_COLOR)}No data yet<br>${swatch(OUT_OF_SERVICE_COLOR)}Out of service`;
     el.classList.remove("hidden");
 }
 
