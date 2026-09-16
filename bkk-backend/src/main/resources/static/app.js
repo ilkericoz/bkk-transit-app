@@ -215,7 +215,7 @@ function predictionLine(vehicle) {
 function lastConfirmedLine(prediction) {
     const confirmed = prediction.lastConfirmedDelay;
     if (!confirmed) {
-        return "<br>Last confirmed delay: n/a (first observed stop on this trip)";
+        return "<br>Last confirmed delay: n/a (no earlier reading available today)";
     }
     const recency = confirmed.minutesAgo != null ? ` (${confirmed.minutesAgo.toFixed(1)} min ago)` : "";
     return `<br>Last confirmed delay: ${Math.round(confirmed.delaySeconds)}s${recency}`;
