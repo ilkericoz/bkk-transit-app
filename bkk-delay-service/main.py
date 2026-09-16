@@ -329,6 +329,7 @@ class Scoreboard(BaseModel):
 
 SCOREBOARD_MAE_WINDOW = 50  # how many recent reconciled predictions the headline MAE is averaged over
 SCOREBOARD_RECENT_DISPLAY = 10  # how many of those are actually shown in the list
+MAX_ABS_RECONCILED_DELAY_SECONDS = 1500  # see the skip below - deliberately tighter than build_delay_dataset.py's 3600s
 
 
 @app.get("/scoreboard", response_model=Scoreboard)
@@ -380,6 +381,27 @@ def scoreboard() -> Scoreboard:
         if scheduled is None:
             continue
         actual_delay_seconds = (actual_recorded_at.astimezone(BUDAPEST_TZ) - scheduled).total_seconds()
+        if abs(actual_delay_seconds) > MAX_ABS_RECONCILED_DELAY_SECONDS:
+            # Same trip_id-reuse family of bug as 6b9af0a: BKK can dispatch a
+            # trip_id more than once a day, or dwell at one stop for many
+            # minutes straight (a terminus/layover), so "the next STOPPED_AT
+            # snapshot after this prediction" can occasionally be a real but
+            # unrelated visit rather than the one actually predicted against.
+            # 1500s chosen from evidence, not guessed: checked the full
+            # distribution of reconciled |actual_delay_seconds| across all
+            # 336 rows on 2026-09-16 - p99 was 807.5s with the next-highest
+            # value already at 1906.2s, a genuine gap, not an arbitrary cut.
+            # Deliberately tighter than build_delay_dataset.py's 3600s (which
+            # is calibrated for a multi-million-row *training* corpus, where
+            # a rare true 30-40min disruption is fine to keep) - this is a
+            # 50-sample *live display* instead, where one such value would
+            # dominate the reported average regardless of whether it's a
+            # mismatch or a genuine rare extreme. Direct inspection of the
+            # two rows this excluded (2026-09-16) found both showed the
+            # concrete signature of a mismatch (a multi-dispatch trip_id gap
+            # in one case, an implausible schedule join in the other), not
+            # proof this can never wrongly exclude a real extreme delay.
+            continue
         entries.append(ScoreboardEntry(
             route_id=route_id,
             vehicle_route_type=vehicle_route_type,
