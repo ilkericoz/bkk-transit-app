@@ -14,7 +14,7 @@ A two-minute guided tour, in order:
 2. **Click any vehicle** — its predicted delay for the *next* stop, right next to its last *confirmed* delay (real GPS data from a minute ago). The two usually track closely — a visible sign the model is reacting to what this specific vehicle is actually doing right now, not reciting a generic route average.
 3. **Bottom-left legend** — the color scale.
 4. **Top-right "Live model accuracy" panel** — a real, continuously-updating scoreboard: every prediction gets logged, then automatically graded against reality once the vehicle actually reaches that stop. Not a canned demo number — it updates while you watch.
-5. **The one to say out loud:** this model beats Google Maps' own transit ETA on real Budapest trips — **~58s average error vs. Google's ~312s**, closer to the real outcome in **68%** of head-to-head comparisons, verified on 189 real reconciled predictions (see "External validation" below for how that comparison was built and debugged).
+5. **The one to say out loud:** this model beats Google Maps' own transit ETA on real Budapest trips — **~66s average error vs. Google's ~327s**, closer to the real outcome in **69%** of head-to-head comparisons, verified on 203 real reconciled predictions (see "External validation" below for how that comparison was built and debugged, and why "we beat Google" isn't quite the right way to frame it).
 
 ## What it does
 
@@ -97,13 +97,23 @@ Beating an internal dumb baseline is a low bar. The real test: for the same real
 2. The first attempted fix for wildly-inflated Google numbers (480s, 840s+) was mathematically a no-op — confirmed by algebra, not just by the numbers staying identical. The real cause: querying from a live GPS point with `departureTime="now"` let Google assume a fresh rider who might board a materially *later* run of the same line — a different real-world service instance than the one being tracked. Fixed by anchoring the query to a stop the trip had *already departed*, with that specific trip's real departure time.
 3. A smaller residual case: one sample's *scheduled* departure was 9 minutes *after* the query was made — a scheduled layover in the timetable, unrelated to when the real vehicle actually left. Fixed by preferring the real observed departure time (already being tracked) over the static schedule.
 
-**Result, on 189 real reconciled comparisons:** this model's mean absolute error is **~58s**, versus **~312s** for Google's Routes API on the same trips — closer to the actual outcome in **68%** of head-to-head comparisons. (Google's Transit mode also has no way to request a specific route/line — confirmed against the actual API schema, not assumed — so match rate is inherently bounded by Budapest's route overlap; comparisons are kept strict, exact-route-only, since loosening them would mean validating against a different vehicle than the one whose real outcome is known.)
+**Result, on 203 real reconciled comparisons:** this model's mean absolute error is **~66s**, versus **~327s** for Google's Routes API on the same trips — closer to the actual outcome in **69%** of head-to-head comparisons. (Google's Transit mode also has no way to request a specific route/line — confirmed against the actual API schema, not assumed — so match rate is inherently bounded by Budapest's route overlap; comparisons are kept strict, exact-route-only, since loosening them would mean validating against a different vehicle than the one whose real outcome is known.)
+
+**Why this isn't really "beating Google":** Google's API is solving a different, harder problem — trip planning for a hypothetical fresh rider at any of thousands of agencies worldwide, without a live relationship to any one specific vehicle. This project tracks one specific transit network's live AVL feed at 15s resolution and knows exactly which physical vehicle is being asked about, its own recent delay, current weather, and the route's recent history — a narrower question with far more contextual signal. The honest framing is "a specialist system with dedicated telemetry for one network outperforms a generalist global router on that network's own vehicle-level predictions," not "beats Google Maps" as a general claim.
 
 ## Scale
 
-- **120M+** vehicle position snapshots collected via the real-time ingestion pipeline.
+- **132M+** vehicle position snapshots collected via the real-time ingestion pipeline (31GB).
 - **6.7M+** labeled (features, delay) training rows built from that history.
 - Continuous operation since late August 2026, surviving multiple reboots via Docker's `restart: unless-stopped`.
+
+## Data & license
+
+Static schedule (GTFS) and real-time vehicle/trip/alert data are provided by BKK Zrt. under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/deed.en) — free to use, share, and build on (including commercially or academically), with one condition: attribution.
+
+> Data source: BKK Zrt., CC BY 4.0
+
+If any part of this project (data, findings, or figures) is reused elsewhere — a thesis included — carry that same attribution line with it.
 
 ## Running it locally
 
@@ -127,3 +137,13 @@ Postgres itself runs natively (a Windows/Linux service), not in Compose — see 
 - Cold-start prediction (a trip's very first observed stop, ~7% of cases) is measurably worse than mid-trip prediction — a likely structural limit without a new data source (e.g. dispatch/shift-start data).
 - No automated test suite yet.
 - Volánbusz/MÁV-START vehicles that appear in BKK's live feed (~3%, a different agency) aren't matched against their own schedules — a legitimate low-priority backlog item, not a bug.
+
+## Changelog
+
+Notable fixes and changes, most recent first (full history: `git log`).
+
+- **2026-09-16** — Removed the unused `POST /api/stops` endpoint: dead code left over from an early Jackson-deserialization teaching example, never called by anything real, and a latent unauthenticated write on a LAN-exposed API.
+- **2026-09-16** — Live accuracy scoreboard's rolling 50-sample MAE was being dominated by 1-2 mismatched reconciliations (BKK reusing a `trip_id` for more than one real dispatch/schedule instance) rather than reflecting real model performance. Added an outlier guard chosen from the actual delay distribution (p99 ≈ 807s, with a genuine gap before the next value at 1906s) rather than an arbitrary cutoff.
+- **2026-09-16** — `/scoreboard` was silently timing out (~52s) once `vehicle_position_snapshots` crossed ~130M rows — a missing composite index meant every reconciliation lookup scanned roughly 1,400 rows per prediction by hand. Added a partial composite index (self-provisioning on startup, so a fresh deployment gets it automatically) — 52s → 0.2s.
+- **2026-09-16** — Reframed the Google Maps benchmark as elapsed travel time instead of absolute delay-vs-schedule (Google's `arrivalTime` can reflect a different real departure than the one being tracked). First real numbers at scale: 66.2s MAE vs. Google's 326.9s, 69% win rate over 203 reconciled comparisons.
+- **2026-09-15** — Fixed `/scoreboard` matching predictions against a stale, pre-prediction arrival when BKK reuses a `trip_id` for more than one real dispatch on the same service date.
