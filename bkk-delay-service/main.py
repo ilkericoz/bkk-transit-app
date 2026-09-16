@@ -208,7 +208,13 @@ def fetch_upstream_delay(gtfs_trip_id: str, stop_sequence: int, service_date: st
     upstream_delay_seconds (a groupby+shift there; a single targeted query
     here, since a live request only ever needs one trip's answer). See
     delay_model.py's NUMERIC_FEATURES comment for why this feature exists.
-    None means no earlier stop has been observed yet (a trip's first stop).
+    None means no earlier stop has been observed *by us* today - not
+    necessarily this trip's actual first stop. Confirmed via real data
+    (2026-09-16): plenty of currently-tracked vehicles sit at stop_sequence
+    15-25+ with zero earlier confirmed stops, most likely because the
+    vehicle entered our 25km tracking radius or our tracking window
+    mid-trip (a relief/substitute vehicle taking over an in-progress trip,
+    or the route's earlier stops simply being outside the polled area).
 
     Opens a fresh connection per call rather than pooling - this endpoint
     is click-triggered from the map (see app.js), not a hot path, so the
@@ -402,16 +408,34 @@ def scoreboard() -> Scoreboard:
             # in one case, an implausible schedule join in the other), not
             # proof this can never wrongly exclude a real extreme delay.
             continue
-        entries.append(ScoreboardEntry(
-            route_id=route_id,
-            vehicle_route_type=vehicle_route_type,
-            predicted_delay_seconds=predicted_delay_seconds,
-            actual_delay_seconds=actual_delay_seconds,
-            error_seconds=abs(predicted_delay_seconds - actual_delay_seconds),
-            predicted_at=predicted_at,
+        entries.append((
+            (trip_id, stop_sequence, service_date),
+            ScoreboardEntry(
+                route_id=route_id,
+                vehicle_route_type=vehicle_route_type,
+                predicted_delay_seconds=predicted_delay_seconds,
+                actual_delay_seconds=actual_delay_seconds,
+                error_seconds=abs(predicted_delay_seconds - actual_delay_seconds),
+                predicted_at=predicted_at,
+            ),
         ))
 
-    entries.sort(key=lambda e: e.predicted_at, reverse=True)
+    entries.sort(key=lambda pair: pair[1].predicted_at, reverse=True)
+    # Two predictions can target the exact same real-world arrival - someone
+    # reopening a vehicle's popup just after the 15s frontend cache expired
+    # (see PREDICTION_TTL_MS in app.js) logs a second, near-identical
+    # prediction_log row for the same (trip_id, stop_sequence, service_date).
+    # Both then reconcile against the same single real outcome, so counting
+    # both double-weights that one event in a 50-sample average. Confirmed
+    # real, not theoretical (2026-09-16): 9 such groups found, all exactly 2
+    # rows, all 16-142s apart - a double-click pattern, not genuinely spaced-
+    # out re-predictions. Keep only the latest (already sorted above) per
+    # target, same DISTINCT-style dedup already used elsewhere in this
+    # project rather than a new one-off pattern.
+    seen_targets = set()
+    entries = [pair for pair in entries if not (pair[0] in seen_targets or seen_targets.add(pair[0]))]
+    entries = [entry for _key, entry in entries]
+
     for_mae = entries[:SCOREBOARD_MAE_WINDOW]
     mean_absolute_error = (
         sum(e.error_seconds for e in for_mae) / len(for_mae) if for_mae else None
