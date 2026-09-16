@@ -59,6 +59,17 @@ services:
       # /predict/from-vehicle call, not just at training time.
       DB_HOST: host.docker.internal
       DB_PASSWORD: ${DB_PASSWORD:-bkk_dev_pw}
+      # OpenBLAS/OpenMP default to one scratch-arena thread per logical core,
+      # which only adds thread-pool sync overhead on a single-row /predict -
+      # measured ~27% lower median / ~35% lower p95 latency capped to 1 vs the
+      # 12-thread default. Must be set as real env vars before numpy imports
+      # inside main.py, so this has to live here (or the Dockerfile), not a
+      # .env file read at runtime. Revisit if DelayModel.predict() is ever
+      # called with large batches instead of one row per request.
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      NUMEXPR_NUM_THREADS: "1"
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
