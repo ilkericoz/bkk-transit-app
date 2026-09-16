@@ -101,6 +101,20 @@ Beating an internal dumb baseline is a low bar. The real test: for the same real
 
 **Why this isn't really "beating Google":** Google's API is solving a different, harder problem — trip planning for a hypothetical fresh rider at any of thousands of agencies worldwide, without a live relationship to any one specific vehicle. This project tracks one specific transit network's live AVL feed at 15s resolution and knows exactly which physical vehicle is being asked about, its own recent delay, current weather, and the route's recent history — a narrower question with far more contextual signal. The honest framing is "a specialist system with dedicated telemetry for one network outperforms a generalist global router on that network's own vehicle-level predictions," not "beats Google Maps" as a general claim.
 
+### A live metric that quietly stopped working, and a wrong first fix along the way
+
+The map's live accuracy panel disappeared. `EXPLAIN ANALYZE` on the reconciliation query showed why: `vehicle_position_snapshots` had grown to 132M rows, and the only index available (`trip_id` alone) wasn't selective enough anymore — each request pulled ~1,400 candidate rows off disk per logged prediction just to filter the rest by hand, 580K+ buffer reads, 52 seconds end to end. Fixed with a composite partial index built `CONCURRENTLY` against the live table (zero downtime, ingestion never paused) — 52s → 0.2s.
+
+That surfaced a second, subtler problem: the live rolling MAE had jumped from ~36s to ~106s. First instinct was to reuse the outlier threshold already established in the training pipeline (`|delay| > 3600s`) — rebuilt, retested, and the number barely moved. **Wrong fix, caught by re-measuring instead of trusting the reasoning:** both actual outlier values (1906s, 2220s) were comfortably under that 3600s bound, which was calibrated for a multi-million-row training corpus, not a 50-sample live display. Re-diagnosed properly by pulling the full delay distribution across all reconciled predictions (p99 ≈ 807s, with a genuine gap before the next value at 1906s) and picking a threshold from that evidence instead of guessing twice. Confirmed via direct inspection of the raw snapshot timestamps that both flagged cases showed the concrete signature of a mismatched reconciliation (BKK reusing a `trip_id` for an unrelated dispatch), not a real model regression. MAE: 106s → 35.75s.
+
+### A cross-language bug that looked like a networking mystery
+
+Wiring the Java backend to call the Python sidecar over plain HTTP, every POST request came back corrupted — but only from Java, never from `curl`. Root cause, found in uvicorn's own log line ("Unsupported upgrade request") rather than guessed: Java's `RestClient` (backed by the JDK's `HttpClient`) was silently attempting an HTTP/2 cleartext ("h2c") upgrade against a plain HTTP service that only speaks HTTP/1.1 — something BKK's own HTTPS endpoint never triggered, since TLS negotiates the protocol version cleanly. Fixed by pinning the request factory to HTTP/1.1 explicitly. A reminder that "it works for the other service" doesn't mean the protocol assumptions are the same underneath.
+
+### Finding an undocumented API limit by testing it, not assuming it
+
+The live map only ever showed traffic within a 6km radius — an arbitrary starting choice, never actually validated. Testing BKK's real-time API directly at increasing radii showed vehicle counts still climbing well past 6km (622 → 1,485 at 15km → 1,714 at 25km) — the original radius was badly under-covering the city. Kept probing until BKK's API returned `LIMIT_EXCEEDED` somewhere between 25km and 28km — a hard cap that isn't documented anywhere BKK publishes, confirmed as a real limit rather than rate-limiting by spacing out retries. Landed on 25km, safely under the cap — nearly 3x the live vehicle coverage, discovered by testing the actual system instead of trusting the original guess.
+
 ## Scale
 
 - **132M+** vehicle position snapshots collected via the real-time ingestion pipeline (31GB).
