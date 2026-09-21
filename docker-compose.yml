@@ -64,6 +64,14 @@ services:
       # default): without it the lookup is skipped and predictions are
       # unaffected, unlike the backend's BKK_API_KEY which is required.
       BKK_API_KEY: ${BKK_API_KEY:-}
+      # Added 2026-09-21: background job that samples random in-service
+      # vehicles through the same prediction path as a map click and logs
+      # ours + BKK's own prediction (source='auto', ignored by the live
+      # scoreboard). Needed because clicks alone log almost nothing on most
+      # days. Set AUTO_SAMPLE_ENABLED to "0" to turn it off.
+      AUTO_SAMPLE_ENABLED: "1"
+      AUTO_SAMPLE_INTERVAL_SECONDS: "300"
+      AUTO_SAMPLE_SIZE: "50"
       # OpenBLAS/OpenMP default to one scratch-arena thread per logical core,
       # which only adds thread-pool sync overhead on a single-row /predict -
       # measured ~27% lower median / ~35% lower p95 latency capped to 1 vs the

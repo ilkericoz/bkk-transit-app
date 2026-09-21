@@ -21,8 +21,11 @@ LAN-only firewall rule and needs no code change to be reachable the
 same way.
 """
 
+import asyncio
 import logging
 import os
+import random
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -142,7 +145,10 @@ async def lifespan(app: FastAPI):
         cur.execute(SCOREBOARD_INDEX_DDL)
         conn.commit()
 
+    sampler = asyncio.create_task(auto_sample_loop()) if AUTO_SAMPLE_ENABLED else None
     yield
+    if sampler is not None:
+        sampler.cancel()
 
 
 app = FastAPI(title="BKK Delay Prediction Service", lifespan=lifespan)
@@ -657,6 +663,17 @@ def predict_from_vehicle(request: LiveVehiclePredictionRequest) -> DelayPredicti
     into a normal "prediction unavailable" response, not a browser-visible
     error.
     """
+    return run_prediction(request, source="click")
+
+
+def run_prediction(request: LiveVehiclePredictionRequest, source: str) -> DelayPredictionResponse:
+    """
+    The one prediction path shared by map clicks (source "click") and the
+    automatic sampling job (source "auto") - kept as a single function so the
+    two can never drift apart in how a live vehicle is turned into a
+    prediction. Logs the prediction (with BKK's own, when available) tagged
+    with its source.
+    """
     if model is None or schedule_lookup is None:
         raise HTTPException(status_code=503, detail="Model or schedule not loaded")
 
@@ -699,5 +716,86 @@ def predict_from_vehicle(request: LiveVehiclePredictionRequest) -> DelayPredicti
         service_date=request.service_date, predicted_delay_seconds=predicted_delay,
         bkk_predicted_delay_seconds=bkk_prediction[0] if bkk_prediction else None,
         bkk_predicted_arrival_epoch=bkk_prediction[1] if bkk_prediction else None,
+        source=source,
     )
     return DelayPredictionResponse(predicted_delay_seconds=predicted_delay, last_confirmed_delay=upstream)
+
+
+# ---------------------------------------------------------------- automatic sampling
+# Added 2026-09-21. Map clicks alone log only a handful of predictions on most
+# days, far too few for a fair comparison against BKK's own predictions. This
+# job periodically takes a random sample of vehicles currently heading to a
+# stop and runs them through the SAME prediction path a click uses
+# (run_prediction), logging source='auto' so the live scoreboard - which only
+# counts source='click' - is unaffected. Off unless AUTO_SAMPLE_ENABLED=1.
+AUTO_SAMPLE_ENABLED = os.environ.get("AUTO_SAMPLE_ENABLED", "0") == "1"
+AUTO_SAMPLE_INTERVAL_SECONDS = int(os.environ.get("AUTO_SAMPLE_INTERVAL_SECONDS", "300"))
+AUTO_SAMPLE_SIZE = int(os.environ.get("AUTO_SAMPLE_SIZE", "50"))
+AUTO_SAMPLE_PAUSE_SECONDS = 0.25  # between vehicles: at most ~4 BKK trip-details calls per second
+
+# The most recent snapshot per vehicle from the last 2 minutes that is heading
+# to a stop on a trip, and for which no prediction (from anyone) has been
+# logged yet for that same trip/stop/date - so each real arrival is sampled at
+# most once, not re-predicted on every cycle. Same fields the Java side
+# forwards on a click.
+AUTO_SAMPLE_CANDIDATES_QUERY = """
+    SELECT DISTINCT ON (s.vehicle_id)
+           s.trip_id, s.route_id, s.stop_id, s.vehicle_route_type,
+           s.stop_sequence, s.service_date, COALESCE(s.deviated, false)
+    FROM vehicle_position_snapshots s
+    WHERE s.recorded_at > now() - interval '2 minutes'
+      AND s.trip_id IS NOT NULL
+      AND s.stop_sequence IS NOT NULL
+      AND s.status = 'IN_TRANSIT_TO'
+      AND s.route_id IS NOT NULL
+      AND s.stop_id IS NOT NULL
+      AND s.vehicle_route_type IS NOT NULL
+      AND COALESCE(s.stale, false) = false
+      AND NOT EXISTS (
+          SELECT 1 FROM prediction_log pl
+          WHERE pl.trip_id = s.trip_id
+            AND pl.stop_sequence = s.stop_sequence
+            AND pl.service_date = s.service_date
+      )
+    ORDER BY s.vehicle_id, s.recorded_at DESC
+"""
+
+
+def auto_sample_once() -> dict:
+    """One sampling cycle. Blocking (DB + HTTP), so the loop runs it in a
+    worker thread. Returns counts for the log line."""
+    with psycopg2.connect(**DB_CONFIG) as conn, conn.cursor() as cur:
+        cur.execute(AUTO_SAMPLE_CANDIDATES_QUERY)
+        candidates = cur.fetchall()
+
+    chosen = random.sample(candidates, min(AUTO_SAMPLE_SIZE, len(candidates)))
+    predicted = skipped = failed = 0
+    for trip_id, route_id, stop_id, vehicle_route_type, stop_sequence, service_date, deviated in chosen:
+        request = LiveVehiclePredictionRequest(
+            trip_id=trip_id, route_id=route_id, stop_id=stop_id, vehicle_route_type=vehicle_route_type,
+            stop_sequence=stop_sequence, service_date=service_date, deviated=bool(deviated),
+        )
+        try:
+            run_prediction(request, source="auto")
+            predicted += 1
+        except HTTPException:
+            skipped += 1  # e.g. a Volán/MÁV trip that is not on BKK's static schedule
+        except Exception as exc:  # noqa: BLE001 - one bad vehicle must not stop the cycle
+            failed += 1
+            logger.warning("auto-sample: prediction failed (%s)", type(exc).__name__)
+        time.sleep(AUTO_SAMPLE_PAUSE_SECONDS)
+    return {"candidates": len(candidates), "sampled": len(chosen), "predicted": predicted,
+            "skipped": skipped, "failed": failed}
+
+
+async def auto_sample_loop() -> None:
+    logger.info("auto-sample: enabled, %d vehicles every %ds", AUTO_SAMPLE_SIZE, AUTO_SAMPLE_INTERVAL_SECONDS)
+    while True:
+        try:
+            counts = await asyncio.to_thread(auto_sample_once)
+            logger.info("auto-sample: %s", counts)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - keep the loop alive across DB/network hiccups
+            logger.warning("auto-sample: cycle failed (%s)", type(exc).__name__)
+        await asyncio.sleep(AUTO_SAMPLE_INTERVAL_SECONDS)
