@@ -31,7 +31,7 @@ flowchart LR
     GTFS[("BKK static\nGTFS feed")] --> Java
     Java["Spring Boot backend\n(Java 25)"] -->|publishes| MQ[["RabbitMQ"]]
     MQ -->|consumes| Java
-    Java <-->|reads/writes| PG[("PostgreSQL\n120M+ rows")]
+    Java <-->|reads/writes| PG[("PostgreSQL\n150M+ rows")]
     Java <-->|REST| Sidecar["FastAPI ML sidecar\n(Python)"]
     Sidecar <-->|reads| PG
     Sidecar --> Weather[("Open-Meteo\nweather API")]
@@ -82,12 +82,12 @@ Rather than guessing at improvements, each one was measured in isolation against
 | Change | Result |
 |---|---|
 | Baseline (route/stop/time-of-day only) | ~94–104s MAE, and more data alone barely moved this ratio — a sign of a feature ceiling, not a data-volume problem |
-| **Upstream delay** — this trip's own delay at its last observed stop | **~101s → ~58s MAE (≈45% reduction)** — delay propagates, and a vehicle's own recent state is far more informative than a historical average |
-| Weather (Open-Meteo, temperature/precipitation/wind) | ~56s → ~53s — real but modest, as expected once the dominant signal was already captured |
+| **Upstream delay** — this trip's own delay at its last observed stop | **~101s → ~58s MAE (≈45% reduction)** — delay propagates, and a vehicle's own recent state is far more informative than a historical average. Re-measured in the 2026-09-21 controlled run: removing it roughly doubles the error (~43s → ~89s), so it still holds up as the dominant signal |
+| Weather (Open-Meteo, temperature/precipitation/wind) | **No measurable effect.** An earlier single run showed ~56s → ~53s, but a controlled re-run (same data, same folds, only weather switched off, paired confidence intervals) finds −0.1 s (95% CI −0.25 to −0.01 s) on the stable days. The earlier "gain" came from a few unstable early folds, where the model had trained on only 1–3 days (see the 2026-09-21 changelog entry) |
 | Route-level live delay (for a trip's first observed stop, which has no upstream reading yet) | Closed the *coverage* gap (0% → 99.8% of previously-blind rows) but not the *accuracy* gap (still ~150s vs ~36s MAE on those rows) — an honestly-reported partial result, not oversold as a fix |
 | `deviated` flag (BKK's own off-route indicator) | Real per-row signal, but only 0.09% of rows are ever flagged — too rare to move an aggregate metric |
 
-Current production model: **gradient-boosted trees, ~53s mean absolute error** (walk-forward validated), down from ~110s for a naive per-route historical average.
+Current production model: **gradient-boosted trees, ~43s mean absolute error** in steady state (walk-forward validated, mean over the 13 daily validation folds from 2 Sep 2026, after the model has at least 5 days of training data), against ~111s for a naive per-route historical average. The older headline of ~53s averaged 17 daily folds *including* the two earliest ones (trained on 1 and 2 days, errors of 145s and 90s), which is why it reads higher; the baseline is ~110s either way. Figures from a controlled re-run on 2026-09-21; see the changelog.
 
 ### External validation: benchmarking against Google Maps
 
@@ -117,7 +117,7 @@ The live map only ever showed traffic within a 6km radius — an arbitrary start
 
 ## Scale
 
-- **132M+** vehicle position snapshots collected via the real-time ingestion pipeline (31GB).
+- **150M+** vehicle position snapshots collected via the real-time ingestion pipeline (38GB including indexes, as of 2026-09-21).
 - **6.7M+** labeled (features, delay) training rows built from that history.
 - Continuous operation since late August 2026, surviving multiple reboots via Docker's `restart: unless-stopped`.
 
@@ -156,6 +156,7 @@ Postgres itself runs natively (a Windows/Linux service), not in Compose — see 
 
 Notable fixes and changes, most recent first (full history: `git log`).
 
+- **2026-09-21** — Reconciled the README's accuracy claims against a controlled re-run (same frozen data and model, one change at a time, paired bootstrap intervals over validation days). (1) The old "~53s" figure averaged 17 daily walk-forward folds including the two earliest, where the model had trained on only 1–2 days (errors of 145s and 90s); re-scoring those 17 folds reproduces 53.1s, while the 13 folds from 2 Sep give ~43s (the per-route baseline is ~110s either way). (2) The earlier weather "gain" (56.1s → 53.3s) came from a few unstable early folds, not a consistent effect: removing weather made one tiny-data fold 43s worse and another 47s better, and on the stable days it changes nothing measurable (−0.1s, 95% CI −0.25 to −0.01). (3) The upstream-delay feature holds up: removing it roughly doubles the error (~43s → ~89s). (4) A "copy the trip's last delay" baseline scores ~63s, so the model adds ~20s beyond that. (5) Scale updated to the measured 150M snapshots / 38GB. The live scoreboard (~63s over clicked predictions) and the Google comparison (66s, elapsed travel time) use different populations and definitions, so they are not directly comparable to the offline figure; a like-for-like live number will come from the automatic sampling rows.
 - **2026-09-21** — Added an automatic sampling job to the delay-service: every 5 minutes it picks up to 50 random vehicles currently heading to a stop (one snapshot per vehicle from the last 2 minutes, skipping any trip/stop/date already predicted) and runs them through the *same* prediction path a map click uses, logging ours plus BKK's own predicted delay with `source = 'auto'`. Map clicks alone logged almost nothing on most days (391 / 26 / 95 predictions on three days, zero on four), far too little for a fair comparison against BKK's predictor. The live scoreboard counts only `click` rows and was verified unchanged (380 reconciled, 63.28 s). To keep the job and the click endpoint from drifting apart, both now call one shared `run_prediction()`. First cycle: 183 eligible, 50 sampled, 42 predicted, 8 skipped (vehicles not on BKK's static schedule), 0 failures; 38 of 42 carried a BKK prediction. Off unless `AUTO_SAMPLE_ENABLED=1`; ~4 BKK trip-details calls per second at most.
 - **2026-09-21** — Added a `source` column to `prediction_log` (existing rows default to `click`, since they were all real map clicks) and made `/scoreboard` count only `source = 'click'` rows, so a future automatic-sampling job can gather more BKK-comparison data without changing what the live scoreboard means. Additive and instant; verified scoreboard identical before and after (379 reconciled, 63.36 s) and new inserts still work.
 - **2026-09-21** — Every `/predict/from-vehicle` call now also looks up BKK's *own* predicted arrival for the same trip and stop (FUTÁR `trip-details`, `predictedArrivalTime` minus scheduled `arrivalTime`) and logs it next to ours in two new nullable `prediction_log` columns, so both can later be graded against the same real arrival. BKK publishes no history of its predictions, so this can only be collected going forward. Additive schema change (`ADD COLUMN IF NOT EXISTS`), best-effort with a 2 s timeout — a failed lookup never affects the prediction, and only the error type is logged since request errors can embed the API key. Verified live: 533 existing rows intact, scoreboard unchanged (379 reconciled, 63.4 s), first row logged ours −32.3 s vs BKK −90.0 s.
@@ -172,7 +173,7 @@ Notable fixes and changes, most recent first (full history: `git log`).
 - **2026-09-15** — Fixed `/scoreboard` matching predictions against a stale, pre-prediction arrival when BKK reuses a `trip_id` for more than one real dispatch on the same service date.
 - **2026-09-15** — Map popup showed raw feed IDs (`BKK_F00969`) instead of real stop names.
 - **2026-09-14** — Building the Google Routes API benchmark surfaced three real measurement bugs, each found by refusing to accept a suspicious number at face value: querying a vehicle's *immediate* next stop returned no transit route (fixed by comparing several stops further down the trip); a first attempted fix for wildly-inflated Google numbers turned out to be mathematically a no-op, the real cause was Google assuming a fresh rider who might board a *later* run of the same line (fixed by anchoring the query to a stop the trip had already departed); and a scheduled-but-not-actual departure time threw off a handful of samples (fixed by preferring the real observed departure). See "External validation" below for the full story.
-- **2026-09-14** — Three delay-prediction features added and measured one at a time: weather (56.1s → 53.3s MAE), route-level live delay for cold-start trips (closed the coverage gap, didn't close the accuracy gap on those rows), and BKK's own `deviated` flag (real per-row signal, too rare to move the aggregate).
+- **2026-09-14** — Three delay-prediction features added and measured one at a time: weather (56.1s → 53.3s MAE; later found to be an artefact of unstable early folds, see 2026-09-21), route-level live delay for cold-start trips (closed the coverage gap, didn't close the accuracy gap on those rows), and BKK's own `deviated` flag (real per-row signal, too rare to move the aggregate).
 - **2026-09-12** — Added the upstream-delay feature (this trip's own delay at its last observed stop) - the single biggest accuracy win of the project, roughly halving prediction error (101.4s → 57.7s MAE).
 - **2026-09-12** — Java's `RestClient` was silently corrupting every POST to the Python sidecar by attempting an HTTP/2 cleartext ("h2c") upgrade that uvicorn doesn't support. Found via uvicorn's own "Unsupported upgrade request" log line; fixed by pinning the request factory to HTTP/1.1.
 - **2026-09-12** — Diagnosed a live "prediction unavailable" bug back to a **9-days-expired static GTFS schedule** — live-vs-static trip ID match rate showed a cliff from ~75% to ~25-43% starting exactly Sep 1 (a mid-season schedule swap, not gradual staleness). Re-downloading the current feed doubled the usable labeled dataset (2.6M → 6.1M rows) — the bug had been silently degrading training data too, not just blocking the new feature.
