@@ -21,6 +21,7 @@ LAN-only firewall rule and needs no code change to be reachable the
 same way.
 """
 
+import logging
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
@@ -28,6 +29,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import psycopg2
+import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
@@ -51,6 +53,17 @@ DB_CONFIG = {
     "user": "bkk_app",
     "password": os.environ.get("DB_PASSWORD", "bkk_dev_pw"),
 }
+
+# BKK's own arrival predictions (added 2026-09-21), logged next to ours on
+# every /predict/from-vehicle call so the two can be compared against the
+# same real outcome later - BKK publishes no history of its predictions, so
+# this data can only be collected going forward, never backfilled. Optional:
+# without BKK_API_KEY in the environment the lookup is simply skipped and
+# predictions still work exactly as before.
+BKK_API_KEY = os.environ.get("BKK_API_KEY", "")
+BKK_TRIP_DETAILS_URL = "https://futar.bkk.hu/api/query/v1/ws/otp/api/where/trip-details.json"
+BKK_LOOKUP_TIMEOUT_SECONDS = 2
+logger = logging.getLogger("uvicorn.error")
 
 # Whichever candidate (baseline/linear/gbt) train_model.py's walk-forward
 # comparison picked as the winner - joblib pickles the concrete class along
@@ -84,6 +97,11 @@ PREDICTION_LOG_DDL = """
     );
     CREATE INDEX IF NOT EXISTS idx_prediction_log_lookup
         ON prediction_log (trip_id, stop_id, stop_sequence, service_date);
+    -- Added 2026-09-21: BKK's own predicted delay for the same trip/stop at
+    -- the same moment (NULL when the lookup was unavailable). Additive and
+    -- nullable on purpose, so existing rows and readers are unaffected.
+    ALTER TABLE prediction_log ADD COLUMN IF NOT EXISTS bkk_predicted_delay_seconds DOUBLE PRECISION;
+    ALTER TABLE prediction_log ADD COLUMN IF NOT EXISTS bkk_predicted_arrival_epoch BIGINT;
 """
 
 # vehicle_position_snapshots is Java's table (Hibernate ddl-auto=update owns
@@ -293,9 +311,42 @@ def fetch_route_recent_delay(route_id: str, exclude_trip_id: str) -> tuple[float
     return sum(delays) / len(delays), True
 
 
+def fetch_bkk_prediction(trip_id: str, stop_sequence: int, service_date: str) -> tuple[float, int] | None:
+    """
+    BKK's own predicted delay (seconds) and predicted arrival (epoch seconds)
+    for this trip at this stop, right now: predictedArrivalTime minus the
+    scheduled arrivalTime, both from the FUTAR trip-details endpoint (a
+    ~4KB response per trip, matched on stopSequence). None on any problem
+    (no key, timeout, unexpected shape, no prediction for that stop) - this
+    is a bonus measurement and must never break or slow the real prediction
+    beyond the short timeout. Only the exception TYPE is logged: a requests
+    error message can contain the full URL, which includes the API key.
+    """
+    if not BKK_API_KEY:
+        return None
+    try:
+        response = requests.get(
+            BKK_TRIP_DETAILS_URL,
+            params={"tripId": trip_id, "date": service_date, "includeReferences": "false", "key": BKK_API_KEY},
+            timeout=BKK_LOOKUP_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        for stop_time in response.json()["data"]["entry"]["stopTimes"]:
+            if stop_time.get("stopSequence") == stop_sequence:
+                scheduled, predicted = stop_time.get("arrivalTime"), stop_time.get("predictedArrivalTime")
+                if scheduled is None or predicted is None:
+                    return None
+                return float(predicted - scheduled), int(predicted)
+    except Exception as exc:  # noqa: BLE001 - see docstring: never let this break a prediction
+        logger.warning("BKK trip-details lookup failed (%s)", type(exc).__name__)
+    return None
+
+
 def log_prediction(
     trip_id: str, route_id: str, stop_id: str, vehicle_route_type: str,
     stop_sequence: int, service_date: str, predicted_delay_seconds: float,
+    bkk_predicted_delay_seconds: float | None = None,
+    bkk_predicted_arrival_epoch: int | None = None,
 ) -> None:
     """
     Records a live prediction so /scoreboard can later reconcile it against
@@ -307,13 +358,15 @@ def log_prediction(
     query = """
         INSERT INTO prediction_log
             (trip_id, route_id, stop_id, vehicle_route_type, stop_sequence,
-             service_date, predicted_delay_seconds, model_type)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+             service_date, predicted_delay_seconds, model_type,
+             bkk_predicted_delay_seconds, bkk_predicted_arrival_epoch)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """
     with psycopg2.connect(**DB_CONFIG) as conn, conn.cursor() as cur:
         cur.execute(query, (
             trip_id, route_id, stop_id, vehicle_route_type, stop_sequence,
             service_date, predicted_delay_seconds, model.name if model else None,
+            bkk_predicted_delay_seconds, bkk_predicted_arrival_epoch,
         ))
         conn.commit()
 
@@ -628,9 +681,12 @@ def predict_from_vehicle(request: LiveVehiclePredictionRequest) -> DelayPredicti
         wind_speed_10m=weather["wind_speed_10m"],
         deviated=int(request.deviated),
     )
+    bkk_prediction = fetch_bkk_prediction(request.trip_id, request.stop_sequence, request.service_date)
     log_prediction(
         trip_id=request.trip_id, route_id=request.route_id, stop_id=request.stop_id,
         vehicle_route_type=request.vehicle_route_type, stop_sequence=request.stop_sequence,
         service_date=request.service_date, predicted_delay_seconds=predicted_delay,
+        bkk_predicted_delay_seconds=bkk_prediction[0] if bkk_prediction else None,
+        bkk_predicted_arrival_epoch=bkk_prediction[1] if bkk_prediction else None,
     )
     return DelayPredictionResponse(predicted_delay_seconds=predicted_delay, last_confirmed_delay=upstream)

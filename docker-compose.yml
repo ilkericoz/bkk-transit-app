@@ -59,6 +59,11 @@ services:
       # /predict/from-vehicle call, not just at training time.
       DB_HOST: host.docker.internal
       DB_PASSWORD: ${DB_PASSWORD:-bkk_dev_pw}
+      # Added 2026-09-21: lets /predict/from-vehicle log BKK's own predicted
+      # arrival next to ours for a like-for-like comparison. Optional (empty
+      # default): without it the lookup is skipped and predictions are
+      # unaffected, unlike the backend's BKK_API_KEY which is required.
+      BKK_API_KEY: ${BKK_API_KEY:-}
       # OpenBLAS/OpenMP default to one scratch-arena thread per logical core,
       # which only adds thread-pool sync overhead on a single-row /predict -
       # measured ~27% lower median / ~35% lower p95 latency capped to 1 vs the
