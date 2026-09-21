@@ -102,6 +102,12 @@ PREDICTION_LOG_DDL = """
     -- nullable on purpose, so existing rows and readers are unaffected.
     ALTER TABLE prediction_log ADD COLUMN IF NOT EXISTS bkk_predicted_delay_seconds DOUBLE PRECISION;
     ALTER TABLE prediction_log ADD COLUMN IF NOT EXISTS bkk_predicted_arrival_epoch BIGINT;
+    -- Added 2026-09-21: where a prediction came from. Every existing row is a
+    -- real map click, so the constant default labels them correctly (a
+    -- metadata-only change in Postgres, instant on any table size). Lets a
+    -- future automatic sampling job (more comparison data) be kept apart from
+    -- the click-based scoreboard - see /scoreboard's WHERE clause.
+    ALTER TABLE prediction_log ADD COLUMN IF NOT EXISTS source VARCHAR(16) NOT NULL DEFAULT 'click';
 """
 
 # vehicle_position_snapshots is Java's table (Hibernate ddl-auto=update owns
@@ -347,6 +353,7 @@ def log_prediction(
     stop_sequence: int, service_date: str, predicted_delay_seconds: float,
     bkk_predicted_delay_seconds: float | None = None,
     bkk_predicted_arrival_epoch: int | None = None,
+    source: str = "click",
 ) -> None:
     """
     Records a live prediction so /scoreboard can later reconcile it against
@@ -359,14 +366,14 @@ def log_prediction(
         INSERT INTO prediction_log
             (trip_id, route_id, stop_id, vehicle_route_type, stop_sequence,
              service_date, predicted_delay_seconds, model_type,
-             bkk_predicted_delay_seconds, bkk_predicted_arrival_epoch)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+             bkk_predicted_delay_seconds, bkk_predicted_arrival_epoch, source)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """
     with psycopg2.connect(**DB_CONFIG) as conn, conn.cursor() as cur:
         cur.execute(query, (
             trip_id, route_id, stop_id, vehicle_route_type, stop_sequence,
             service_date, predicted_delay_seconds, model.name if model else None,
-            bkk_predicted_delay_seconds, bkk_predicted_arrival_epoch,
+            bkk_predicted_delay_seconds, bkk_predicted_arrival_epoch, source,
         ))
         conn.commit()
 
@@ -433,6 +440,10 @@ def scoreboard() -> Scoreboard:
          -- error. Only an arrival that happened after the prediction counts as
          -- what the prediction was actually judged against.
          AND vs.recorded_at > pl.predicted_at
+        -- Only predictions a person actually requested by clicking. Rows from
+        -- any future automatic sampling job (source != 'click') are analysed
+        -- separately and must not change what this live scoreboard means.
+        WHERE pl.source = 'click'
         ORDER BY pl.id, vs.recorded_at ASC
     """
     with psycopg2.connect(**DB_CONFIG) as conn, conn.cursor() as cur:
