@@ -153,13 +153,15 @@ Postgres itself runs natively (a Windows/Linux service), not in Compose — see 
 ## Known limitations
 
 - Cold-start prediction (a trip's very first observed stop, ~7% of cases) is measurably worse than mid-trip prediction — a likely structural limit without a new data source (e.g. dispatch/shift-start data).
-- Live accuracy (~66s MAE across all reconciled predictions) is meaningfully worse than the offline walk-forward figure (~44s) — driven largely by the same hard subgroup as cold-start (~155s MAE on the ~10% of live predictions where BKK's own predictor also has nothing to say), since live prediction demand isn't an even sample of stops the way offline scoring is. Loses head-to-head against BKK's own GTFS-RT prediction (55.9s vs. 44.3s MAE, see "External validation").
+- Live accuracy (~53s MAE across reconciled predictions) is still worse than the offline walk-forward figure (~44s). Part of the earlier, larger gap (~66s) turned out to be measurement, not model error (see the 2026-09-23 changelog entry); what remains is likely the hard cold-start subgroup (~155s MAE on the ~10% of live predictions where BKK's own predictor also has nothing to say), since live prediction demand isn't an even sample of stops the way offline scoring is. First stops remain the weakest case — vehicles arrive early and wait there, so "arrival" at a first stop is poorly defined. Loses head-to-head against BKK's own GTFS-RT prediction (55.9s vs. 44.3s MAE, see "External validation").
 - No automated test suite yet.
 - Volánbusz/MÁV-START vehicles that appear in BKK's live feed (~3%, a different agency) aren't matched against their own schedules — a legitimate low-priority backlog item, not a bug.
 
 ## Changelog
 
 Notable fixes and changes, most recent first (full history: `git log`).
+
+- **2026-09-23** — `/scoreboard` now excludes predictions made for a stop the vehicle had *already reached*. The auto-sampler only picks vehicles "in transit to" a stop, but BKK's status can flip back to in-transit while the vehicle is still standing there; the real arrival then predates the prediction, so reconciliation could only find a later sighting of the same visit and scored against that instead. Found by independently re-deriving the scoreboard from raw data: the old 66.7s was arithmetically right, but 1,753 of 10,224 rows (17%) were in this state (median 0.5 min after the real arrival), scoring 131s MAE vs. 53s for the rest. Live MAE is now **53.3s** (8,482 predictions). Also a likely part of the offline-vs-live gap: offline labels use a stop's *first* sighting, while these rows were scored against a later one.
 
 - **2026-09-23** — Static frontend files are now served with `Cache-Control: no-cache` (`spring.web.resources.cache.cachecontrol.no-cache`). Found while verifying the fix below: the deployed fix was correct server-side, but the browser kept running its heuristically-cached old `app.js` until a hard refresh. Now the browser revalidates on every load — a cheap `304 Not Modified` when nothing changed, the new file when it did.
 
