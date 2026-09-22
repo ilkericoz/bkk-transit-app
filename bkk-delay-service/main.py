@@ -415,13 +415,38 @@ def scoreboard() -> Scoreboard:
     """
     Reconciles logged predictions against what actually happened, computed
     on read rather than via a background job - prediction_log's volume
-    (bounded by how often someone clicks a vehicle on the map) is small
-    enough that there's no real cost to just joining at request time,
-    which is a lot simpler than maintaining a separate reconciliation
-    process. DISTINCT ON picks the earliest STOPPED_AT/100% sighting per
-    logged prediction, same "first poll that caught it arrived" definition
-    of actual arrival used everywhere else in this project (see
-    build_delay_dataset.py's fetch_actual_arrivals).
+    (a few hundred click rows plus a bounded 50-per-5-minutes auto-sampling
+    job) is small enough that there's no real cost to just joining at
+    request time, which is a lot simpler than maintaining a separate
+    reconciliation process. DISTINCT ON picks the earliest STOPPED_AT/100%
+    sighting per logged prediction, same "first poll that caught it
+    arrived" definition of actual arrival used everywhere else in this
+    project (see build_delay_dataset.py's fetch_actual_arrivals).
+
+    Counts both click and auto-sampled predictions (see run_prediction's
+    source argument). Originally this counted only source='click', so the
+    then-brand-new auto-sampling job (2026-09-21) couldn't change what the
+    live number meant on day one. That precaution is no longer needed:
+    click volume stayed tiny (a few hundred rows, mostly from before the
+    09-14 feature-engineering work) while auto now has thousands - a more
+    representative population, not a different one, so it's the honest
+    default going forward.
+
+    Deliberately does NOT filter to rows where BKK also has a comparable
+    prediction (bkk_predicted_delay_seconds IS NOT NULL) even though that
+    would raise this number - measured 2026-09-22: 56.3s MAE on the ~90%
+    of reconciled rows BKK could also predict vs. 155.2s on the ~10% it
+    couldn't (closely matching the ~153s cold-start MAE found 2026-09-14
+    on trips with no upstream-delay reading yet - the same hard subgroup,
+    corroborated two different ways). Excluding them would flatter this
+    panel by selecting for the easier cases; this number should reflect
+    real prediction quality across everything actually served, not just
+    the subset a second source happens to agree is comparable. This
+    widened the gap against the offline walk-forward MAE (~44-50s in
+    steady state) rather than closing it, contrary to the original
+    expectation when this change was made - the click-only number (~63s)
+    turned out to be closer to reality mostly by chance of a small,
+    stale sample, not because it was measuring something different.
     """
     query = """
         SELECT DISTINCT ON (pl.id)
@@ -446,10 +471,9 @@ def scoreboard() -> Scoreboard:
          -- error. Only an arrival that happened after the prediction counts as
          -- what the prediction was actually judged against.
          AND vs.recorded_at > pl.predicted_at
-        -- Only predictions a person actually requested by clicking. Rows from
-        -- any future automatic sampling job (source != 'click') are analysed
-        -- separately and must not change what this live scoreboard means.
-        WHERE pl.source = 'click'
+        -- Both real map clicks and the automatic sampler (see the docstring
+        -- above for why these are no longer kept separate).
+        WHERE pl.source IN ('click', 'auto')
         ORDER BY pl.id, vs.recorded_at ASC
     """
     with psycopg2.connect(**DB_CONFIG) as conn, conn.cursor() as cur:
