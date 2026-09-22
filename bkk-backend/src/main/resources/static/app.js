@@ -73,15 +73,20 @@ function markerStyleFor(vehicle) {
     if (!vehicle.tripId) {
         return { color: OUT_OF_SERVICE_COLOR, fillOpacity: OUT_OF_SERVICE_FILL_OPACITY };
     }
-    const color = delayColor(currentDelaysByTripId.get(vehicle.tripId)?.delaySeconds);
+    const color = delayColor(currentDelaysByTrip.get(tripKey(vehicle.serviceDate, vehicle.tripId))?.delaySeconds);
     return { color, fillOpacity: IN_SERVICE_FILL_OPACITY };
 }
 
-// Keyed by tripId, matching the /current-delays response's own keying -
-// refreshed once per vehicle poll (see refreshDelayColors), not per
-// popup click. A tripId missing from this map means "no confirmed
-// arrival yet today", not an error.
-let currentDelaysByTripId = new Map();
+// Keyed by serviceDate + tripId, not tripId alone - BKK reuses the same
+// tripId every day, and just after midnight the map holds vehicles from
+// two service days at once (see refreshDelayColors). Refreshed once per
+// vehicle poll, not per popup click. A key missing from this map means
+// "no confirmed arrival yet today", not an error.
+let currentDelaysByTrip = new Map();
+
+function tripKey(serviceDate, tripId) {
+    return `${serviceDate}|${tripId}`;
+}
 
 // Keyed by the real-time routeId format ("BKK_" + static route_id, same
 // prefix convention as tripId/stopId) so lookups from vehicle data need no
@@ -339,21 +344,45 @@ function updateMarkers(vehicles) {
 // color, not one call per vehicle - see main.py's /vehicles/current-delays
 // docstring for the cost reasoning (same one that made per-click
 // prediction lazy in the first place).
+//
+// One call per distinct serviceDate, not one for the whole fleet: this
+// used to send the *first* vehicle's serviceDate for every tripId, so just
+// after midnight (vehicles still finishing yesterday's service day next to
+// ones on today's) a vehicle could be colored from yesterday's run of the
+// same tripId - a red marker next to a popup saying -9s. Normally this is
+// still a single call; around midnight it's two.
 function refreshDelayColors(vehicles) {
-    const tripIds = vehicles.map((v) => v.tripId).filter(Boolean);
-    const serviceDate = vehicles.find((v) => v.serviceDate)?.serviceDate;
-    if (tripIds.length === 0 || !serviceDate) {
+    const tripIdsByServiceDate = new Map();
+    for (const vehicle of vehicles) {
+        if (!vehicle.tripId || !vehicle.serviceDate) continue;
+        if (!tripIdsByServiceDate.has(vehicle.serviceDate)) {
+            tripIdsByServiceDate.set(vehicle.serviceDate, []);
+        }
+        tripIdsByServiceDate.get(vehicle.serviceDate).push(vehicle.tripId);
+    }
+    if (tripIdsByServiceDate.size === 0) {
         return;
     }
 
-    fetch("/api/vehicles/current-delays", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ tripIds, serviceDate }),
-    })
-        .then((response) => response.json())
-        .then((delays) => {
-            currentDelaysByTripId = new Map(Object.entries(delays));
+    const requests = [...tripIdsByServiceDate].map(([serviceDate, tripIds]) =>
+        fetch("/api/vehicles/current-delays", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ tripIds, serviceDate }),
+        })
+            .then((response) => response.json())
+            .then((delays) => ({ serviceDate, delays }))
+    );
+
+    Promise.all(requests)
+        .then((results) => {
+            const merged = new Map();
+            for (const { serviceDate, delays } of results) {
+                for (const [tripId, delay] of Object.entries(delays)) {
+                    merged.set(tripKey(serviceDate, tripId), delay);
+                }
+            }
+            currentDelaysByTrip = merged;
             for (const vehicle of vehicles) {
                 const marker = markersById.get(vehicle.vehicleId);
                 if (!marker) continue;
