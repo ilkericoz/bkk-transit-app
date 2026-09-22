@@ -447,6 +447,12 @@ def scoreboard() -> Scoreboard:
     expectation when this change was made - the click-only number (~63s)
     turned out to be closer to reality mostly by chance of a small,
     stale sample, not because it was measuring something different.
+
+    Unlike the no-BKK-prediction rows above, predictions for a stop the
+    vehicle had already reached ARE excluded (2026-09-23, see the NOT
+    EXISTS in the query) - not because they're hard, but because their
+    real outcome happened before the prediction and can't be measured by
+    this join at all. That took the number from 66.7s to ~53s.
     """
     query = """
         SELECT DISTINCT ON (pl.id)
@@ -474,6 +480,27 @@ def scoreboard() -> Scoreboard:
         -- Both real map clicks and the automatic sampler (see the docstring
         -- above for why these are no longer kept separate).
         WHERE pl.source IN ('click', 'auto')
+          -- Skip predictions for a stop the vehicle had ALREADY reached when
+          -- the prediction was made. The sampler only picks IN_TRANSIT_TO
+          -- vehicles, but BKK's status can flip back to IN_TRANSIT_TO while
+          -- the vehicle is still standing at the stop. The real arrival then
+          -- happened before predicted_at, so the join above can only find a
+          -- later sighting of the same visit - scoring against a moment the
+          -- vehicle was just still standing there, not its arrival. Measured
+          -- 2026-09-23: 1,753 of 10,224 rows (17%, median 0.5 min after the
+          -- real arrival, so the same visit rather than trip_id reuse); they
+          -- scored 131s MAE vs. 53s for the rest, with a mean "actual" delay
+          -- of +83s as scored vs. -167s at the real first arrival.
+          AND NOT EXISTS (
+              SELECT 1 FROM vehicle_position_snapshots prior
+              WHERE prior.trip_id = pl.trip_id
+                AND prior.stop_id = pl.stop_id
+                AND prior.stop_sequence = pl.stop_sequence
+                AND prior.service_date = pl.service_date
+                AND prior.status = 'STOPPED_AT'
+                AND prior.stop_distance_percent = 100
+                AND prior.recorded_at <= pl.predicted_at
+          )
         ORDER BY pl.id, vs.recorded_at ASC
     """
     with psycopg2.connect(**DB_CONFIG) as conn, conn.cursor() as cur:
