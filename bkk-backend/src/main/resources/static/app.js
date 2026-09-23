@@ -48,13 +48,15 @@ const DELAY_COLOR_BUCKETS = [
     { max: Infinity, color: "#e74c3c", label: "Severe delay (6+ min)" },
 ];
 const NO_DELAY_DATA_COLOR = "#95a5a6";
-// A confirmed delay older than this is shown as "no recent data" (grey)
-// rather than its old color. The color never expired before 2026-09-24:
-// vehicles heading out of service after their last trip (no current stop,
-// but still carrying the trip) kept a color from a stop confirmed 10 min to
-// ~2 h earlier - most of the red markers left after the standing-still fix.
-// 10 min is well past the normal gap between confirmed stops (median ~1
-// min, 90% within ~5 min, measured on the live map).
+// A confirmed delay older than its cutoff is shown as "no recent data"
+// (grey) rather than its old color. The color never expired before
+// 2026-09-24: vehicles heading out of service after their last trip (no
+// current stop, but still carrying the trip) kept a color from a stop
+// confirmed 10 min to ~2 h earlier. The cutoff comes from the server per
+// trip (staleAfterMinutes, see main.py's STALE_MIN_MINUTES): at least 10
+// min, longer when the timetable says the next stop is far away, so night
+// buses on long stretches keep their color. This constant is only the
+// fallback if the server doesn't send one.
 const MAX_DELAY_AGE_MINUTES = 10;
 // A vehicle with no tripId isn't "waiting for data" - BKK hasn't linked it to
 // any scheduled trip at all, which in practice almost always means it's
@@ -82,7 +84,7 @@ function markerStyleFor(vehicle) {
         return { color: OUT_OF_SERVICE_COLOR, fillOpacity: OUT_OF_SERVICE_FILL_OPACITY };
     }
     const confirmed = currentDelaysByTrip.get(tripKey(vehicle.serviceDate, vehicle.tripId));
-    const fresh = confirmed && confirmed.minutesAgo <= MAX_DELAY_AGE_MINUTES;
+    const fresh = confirmed && confirmed.minutesAgo <= (confirmed.staleAfterMinutes ?? MAX_DELAY_AGE_MINUTES);
     const color = delayColor(fresh ? confirmed.delaySeconds : null);
     return { color, fillOpacity: IN_SERVICE_FILL_OPACITY };
 }

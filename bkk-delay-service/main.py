@@ -625,12 +625,30 @@ class CurrentDelaysRequest(BaseModel):
     service_date: str = Field(examples=["20260914"])
 
 
+# When the map should stop trusting a confirmed delay and show "no recent
+# data" instead (added 2026-09-24). Never sooner than STALE_MIN_MINUTES
+# (buses skip stops nobody uses, so a missing confirmation at the very next
+# stop is normal), but later when the timetable says the next stop is far
+# away - GRACE minutes past when the vehicle, running at its current delay,
+# should have reached it. A fixed 10-min cutoff greyed real night buses on
+# long stretches (9 of 181 vehicles on the first night check).
+STALE_MIN_MINUTES = 10
+STALE_GRACE_MINUTES = 5
+
+
+class CurrentDelayReading(BaseModel):
+    delay_seconds: float
+    minutes_ago: float
+    # Show this delay only while minutes_ago <= stale_after_minutes.
+    stale_after_minutes: float
+
+
 class CurrentDelaysResponse(BaseModel):
     # Keyed by tripId - a trip missing from this dict means "no confirmed
     # arrival for it yet today" (its very first stop hasn't happened), not
     # an error; the caller (the map) should render that as "no data yet"
     # rather than treat it as a failure.
-    delays: dict[str, UpstreamDelayReading]
+    delays: dict[str, CurrentDelayReading]
 
 
 @app.post("/vehicles/current-delays", response_model=CurrentDelaysResponse)
@@ -688,18 +706,26 @@ def vehicles_current_delays(request: CurrentDelaysRequest) -> CurrentDelaysRespo
         cur.execute(query, {"trip_ids": request.trip_ids, "service_date": request.service_date})
         rows = cur.fetchall()
 
-    delays: dict[str, UpstreamDelayReading] = {}
+    delays: dict[str, CurrentDelayReading] = {}
     now = datetime.now(BUDAPEST_TZ)
     for trip_id, stop_sequence, recorded_at in rows:
-        scheduled = schedule_lookup.scheduled_arrival(
-            trip_id.removeprefix("BKK_"), stop_sequence, request.service_date
-        )
+        gtfs_trip_id = trip_id.removeprefix("BKK_")
+        scheduled = schedule_lookup.scheduled_arrival(gtfs_trip_id, stop_sequence, request.service_date)
         if scheduled is None:
             continue
         recorded_at = recorded_at.astimezone(BUDAPEST_TZ)
-        delays[trip_id] = UpstreamDelayReading(
-            delay_seconds=(recorded_at - scheduled).total_seconds(),
+        delay = timedelta(seconds=(recorded_at - scheduled).total_seconds())
+        # Stop numbers run 1..n without gaps in every BKK trip (checked
+        # 2026-09-24), so the next stop is simply +1; None = last stop.
+        next_scheduled = schedule_lookup.scheduled_arrival(gtfs_trip_id, stop_sequence + 1, request.service_date)
+        stale_after = STALE_MIN_MINUTES
+        if next_scheduled is not None:
+            minutes_to_next = (next_scheduled + delay - recorded_at).total_seconds() / 60
+            stale_after = max(STALE_MIN_MINUTES, minutes_to_next + STALE_GRACE_MINUTES)
+        delays[trip_id] = CurrentDelayReading(
+            delay_seconds=delay.total_seconds(),
             minutes_ago=(now - recorded_at).total_seconds() / 60,
+            stale_after_minutes=stale_after,
         )
     return CurrentDelaysResponse(delays=delays)
 

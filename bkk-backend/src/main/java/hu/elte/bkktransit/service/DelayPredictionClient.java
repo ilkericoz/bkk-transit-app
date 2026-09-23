@@ -153,8 +153,15 @@ public class DelayPredictionClient {
     ) {
     }
 
+    private record UpstreamCurrentDelayReading(
+            @JsonProperty("delay_seconds") double delaySeconds,
+            @JsonProperty("minutes_ago") double minutesAgo,
+            @JsonProperty("stale_after_minutes") double staleAfterMinutes
+    ) {
+    }
+
     private record UpstreamCurrentDelaysResponse(
-            @JsonProperty("delays") Map<String, UpstreamDelayReading> delays
+            @JsonProperty("delays") Map<String, UpstreamCurrentDelayReading> delays
     ) {
     }
 
@@ -175,6 +182,7 @@ public class DelayPredictionClient {
         return response.delays().entrySet().stream()
                 .collect(Collectors.toMap(
                         Map.Entry::getKey,
-                        e -> new CurrentDelay(e.getValue().delaySeconds(), e.getValue().minutesAgo())));
+                        e -> new CurrentDelay(e.getValue().delaySeconds(), e.getValue().minutesAgo(),
+                                e.getValue().staleAfterMinutes())));
     }
 }
