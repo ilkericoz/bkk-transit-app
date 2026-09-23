@@ -48,6 +48,14 @@ const DELAY_COLOR_BUCKETS = [
     { max: Infinity, color: "#e74c3c", label: "Severe delay (6+ min)" },
 ];
 const NO_DELAY_DATA_COLOR = "#95a5a6";
+// A confirmed delay older than this is shown as "no recent data" (grey)
+// rather than its old color. The color never expired before 2026-09-24:
+// vehicles heading out of service after their last trip (no current stop,
+// but still carrying the trip) kept a color from a stop confirmed 10 min to
+// ~2 h earlier - most of the red markers left after the standing-still fix.
+// 10 min is well past the normal gap between confirmed stops (median ~1
+// min, 90% within ~5 min, measured on the live map).
+const MAX_DELAY_AGE_MINUTES = 10;
 // A vehicle with no tripId isn't "waiting for data" - BKK hasn't linked it to
 // any scheduled trip at all, which in practice almost always means it's
 // deadheading (destination sign reads "nem szállít utasokat" / "kocsiszínbe"
@@ -73,7 +81,9 @@ function markerStyleFor(vehicle) {
     if (!vehicle.tripId) {
         return { color: OUT_OF_SERVICE_COLOR, fillOpacity: OUT_OF_SERVICE_FILL_OPACITY };
     }
-    const color = delayColor(currentDelaysByTrip.get(tripKey(vehicle.serviceDate, vehicle.tripId))?.delaySeconds);
+    const confirmed = currentDelaysByTrip.get(tripKey(vehicle.serviceDate, vehicle.tripId));
+    const fresh = confirmed && confirmed.minutesAgo <= MAX_DELAY_AGE_MINUTES;
+    const color = delayColor(fresh ? confirmed.delaySeconds : null);
     return { color, fillOpacity: IN_SERVICE_FILL_OPACITY };
 }
 
@@ -413,7 +423,7 @@ function renderLegend() {
     const el = document.getElementById("legend");
     const swatch = (color) => `<span style="display:inline-block;width:10px;height:10px;background:${color};margin-right:6px;border-radius:2px;"></span>`;
     const rows = DELAY_COLOR_BUCKETS.map((b) => `${swatch(b.color)}${b.label}<br>`).join("");
-    el.innerHTML = `<strong>Delay</strong><br>${rows}${swatch(NO_DELAY_DATA_COLOR)}No data yet<br>${swatch(OUT_OF_SERVICE_COLOR)}Out of service`;
+    el.innerHTML = `<strong>Delay</strong><br>${rows}${swatch(NO_DELAY_DATA_COLOR)}No recent data<br>${swatch(OUT_OF_SERVICE_COLOR)}Out of service`;
     el.classList.remove("hidden");
 }
 
