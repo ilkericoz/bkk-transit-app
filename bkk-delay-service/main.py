@@ -251,8 +251,12 @@ def fetch_upstream_delay(gtfs_trip_id: str, stop_sequence: int, service_date: st
     extra ~10-20ms of connection setup isn't worth the added complexity of
     a pool at this project's current scale.
     """
+    # A trip's first stop (stop_sequence 1) is measured by its DEPARTURE -
+    # the last sighting there - matching build_delay_dataset.py's label, so
+    # the model gets the same upstream value live as it was trained on.
     query = """
-        SELECT stop_sequence, MIN(recorded_at) AS recorded_at
+        SELECT stop_sequence,
+               CASE WHEN stop_sequence = 1 THEN MAX(recorded_at) ELSE MIN(recorded_at) END AS recorded_at
         FROM vehicle_position_snapshots
         WHERE trip_id = %s
           AND service_date = %s
@@ -480,6 +484,11 @@ def scoreboard() -> Scoreboard:
         -- Both real map clicks and the automatic sampler (see the docstring
         -- above for why these are no longer kept separate).
         WHERE pl.source IN ('click', 'auto')
+          -- Not applied to first stops (stop_sequence 1): those are scored
+          -- on DEPARTURE (see the ORDER BY), and a vehicle already waiting
+          -- there hasn't departed yet - the departure is still ahead of the
+          -- prediction, so it's a fair thing to score.
+          --
           -- Skip predictions for a stop the vehicle had ALREADY reached when
           -- the prediction was made. The sampler only picks IN_TRANSIT_TO
           -- vehicles, but BKK's status can flip back to IN_TRANSIT_TO while
@@ -491,7 +500,7 @@ def scoreboard() -> Scoreboard:
           -- real arrival, so the same visit rather than trip_id reuse); they
           -- scored 131s MAE vs. 53s for the rest, with a mean "actual" delay
           -- of +83s as scored vs. -167s at the real first arrival.
-          AND NOT EXISTS (
+          AND (pl.stop_sequence = 1 OR NOT EXISTS (
               SELECT 1 FROM vehicle_position_snapshots prior
               WHERE prior.trip_id = pl.trip_id
                 AND prior.stop_id = pl.stop_id
@@ -500,8 +509,15 @@ def scoreboard() -> Scoreboard:
                 AND prior.status = 'STOPPED_AT'
                 AND prior.stop_distance_percent = 100
                 AND prior.recorded_at <= pl.predicted_at
-          )
-        ORDER BY pl.id, vs.recorded_at ASC
+          ))
+        -- Earliest sighting after the prediction = the arrival; except at a
+        -- first stop, where the LATEST sighting = the departure, the event
+        -- first stops are labelled by in training (build_delay_dataset.py).
+        -- For other stops the CASE is NULL on every row, so the tie-break
+        -- recorded_at ASC decides, exactly as before.
+        ORDER BY pl.id,
+                 CASE WHEN pl.stop_sequence = 1 THEN vs.recorded_at END DESC NULLS LAST,
+                 vs.recorded_at ASC
     """
     with psycopg2.connect(**DB_CONFIG) as conn, conn.cursor() as cur:
         cur.execute(query)

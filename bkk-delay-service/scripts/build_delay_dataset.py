@@ -11,6 +11,16 @@ together uniquely identify one scheduled stop visit within one trip.
 delay_seconds = actual_arrival - scheduled_arrival
   positive => vehicle was late, negative => vehicle was early.
 
+Except at a trip's FIRST stop (stop_sequence 1 - true for every trip in
+BKK's stop_times.txt, checked 2026-09-23), where the label is the DEPARTURE:
+the LAST STOPPED_AT/100% sighting there. Vehicles turn up at the first stop
+early and wait (mean first-sighting "delay" -238 s, 90% early), so the
+first sighting measures when the vehicle arrived to wait, not when the trip
+started - and a rider at a first stop only cares when it leaves. The
+scheduled side needs no change: arrival_time == departure_time at every
+first stop in the static schedule (also checked 2026-09-23). The
+label_event column says which event each row's label measures.
+
 This does NOT use BKK's own predictedArrivalTime/predictedDepartureTime
 (available from their trip-details.json) - the whole point is to compute a
 ground-truth label from our own collected AVL data, not relay BKK's own
@@ -71,6 +81,11 @@ def fetch_actual_arrivals() -> pd.DataFrame:
     true arrival instant. DISTINCT ON (rather than GROUP BY + MIN) so
     `deviated` also comes from that exact earliest row, not an ambiguous
     aggregate over however many polls caught the vehicle still parked.
+
+    last_seen_at is the LATEST sighting of the same visit - the departure
+    proxy, used only for first stops (see the module docstring). It lags
+    the real departure by up to one poll (~15s), mirroring the first
+    sighting's lag behind the real arrival.
     """
     query = """
         SELECT DISTINCT ON (trip_id, stop_id, stop_sequence, route_id, vehicle_route_type, service_date)
@@ -81,6 +96,9 @@ def fetch_actual_arrivals() -> pd.DataFrame:
                vehicle_route_type,
                service_date,
                recorded_at AS actual_arrival,
+               MAX(recorded_at) OVER (
+                   PARTITION BY trip_id, stop_id, stop_sequence, route_id, vehicle_route_type, service_date
+               ) AS last_seen_at,
                deviated
         FROM vehicle_position_snapshots
         WHERE trip_id IS NOT NULL
@@ -143,6 +161,15 @@ def build_dataset() -> pd.DataFrame:
     # timestamps in the same civil timezone rather than relying on UTC
     # offsets happening to line up.
     merged["actual_arrival"] = pd.to_datetime(merged["actual_arrival"], utc=True).dt.tz_convert(BUDAPEST_TZ)
+    merged["last_seen_at"] = pd.to_datetime(merged["last_seen_at"], utc=True).dt.tz_convert(BUDAPEST_TZ)
+
+    # First stops are labelled by departure, not arrival - see the module
+    # docstring. actual_arrival keeps its name so every downstream reader
+    # (train_model.py, the thesis scripts) works unchanged; label_event
+    # records which event it actually is.
+    first_stop = merged["stop_sequence"] == 1
+    merged.loc[first_stop, "actual_arrival"] = merged.loc[first_stop, "last_seen_at"]
+    merged["label_event"] = first_stop.map({True: "departure", False: "arrival"})
 
     merged["delay_seconds"] = (
         merged["actual_arrival"] - merged["scheduled_arrival"]
@@ -240,7 +267,7 @@ def build_dataset() -> pd.DataFrame:
         "upstream_delay_seconds", "has_upstream_delay",
         "route_recent_delay_seconds", "has_route_recent_delay",
         "temperature_2m", "precipitation", "wind_speed_10m",
-        "deviated",
+        "deviated", "label_event",
     ]].rename(columns={"gtfs_trip_id": "trip_id"})
 
 
