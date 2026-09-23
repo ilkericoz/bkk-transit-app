@@ -411,6 +411,14 @@ class Scoreboard(BaseModel):
 # number and a visibly calmer one. (Flagged directly: 2026-09-16, the
 # rolling-window number looked misleading/noisy to a viewer.)
 SCOREBOARD_BEST_DISPLAY = 5  # how many of the most-accurate reconciled predictions to surface as examples
+# When first stops started being predicted and scored by DEPARTURE (the
+# model retrained on departure labels went live). Earlier stop-1 predictions
+# were made by a model trained on the old ARRIVAL label, so they're still
+# scored against the arrival - each prediction is judged against the event
+# it was actually predicting. (Last old-model prediction 13:55:49, first new
+# one 13:58:38, per prediction_log.model_type.)
+FIRST_STOP_DEPARTURE_SINCE = "2026-09-23 13:56:30+02:00"
+
 MAX_ABS_RECONCILED_DELAY_SECONDS = 1500  # see the skip below - deliberately tighter than build_delay_dataset.py's 3600s
 
 
@@ -484,10 +492,10 @@ def scoreboard() -> Scoreboard:
         -- Both real map clicks and the automatic sampler (see the docstring
         -- above for why these are no longer kept separate).
         WHERE pl.source IN ('click', 'auto')
-          -- Not applied to first stops (stop_sequence 1): those are scored
-          -- on DEPARTURE (see the ORDER BY), and a vehicle already waiting
-          -- there hasn't departed yet - the departure is still ahead of the
-          -- prediction, so it's a fair thing to score.
+          -- Not applied to first-stop predictions scored on DEPARTURE (see
+          -- the ORDER BY and FIRST_STOP_DEPARTURE_SINCE): a vehicle already
+          -- waiting there hasn't departed yet - the departure is still ahead
+          -- of the prediction, so it's a fair thing to score.
           --
           -- Skip predictions for a stop the vehicle had ALREADY reached when
           -- the prediction was made. The sampler only picks IN_TRANSIT_TO
@@ -496,11 +504,11 @@ def scoreboard() -> Scoreboard:
           -- happened before predicted_at, so the join above can only find a
           -- later sighting of the same visit - scoring against a moment the
           -- vehicle was just still standing there, not its arrival. Measured
-          -- 2026-09-23: 1,753 of 10,224 rows (17%, median 0.5 min after the
+          -- 2026-09-23: 1,753 of 10,224 rows (17 percent, median 0.5 min after the
           -- real arrival, so the same visit rather than trip_id reuse); they
           -- scored 131s MAE vs. 53s for the rest, with a mean "actual" delay
           -- of +83s as scored vs. -167s at the real first arrival.
-          AND (pl.stop_sequence = 1 OR NOT EXISTS (
+          AND ((pl.stop_sequence = 1 AND pl.predicted_at >= %(departure_since)s) OR NOT EXISTS (
               SELECT 1 FROM vehicle_position_snapshots prior
               WHERE prior.trip_id = pl.trip_id
                 AND prior.stop_id = pl.stop_id
@@ -510,17 +518,18 @@ def scoreboard() -> Scoreboard:
                 AND prior.stop_distance_percent = 100
                 AND prior.recorded_at <= pl.predicted_at
           ))
-        -- Earliest sighting after the prediction = the arrival; except at a
-        -- first stop, where the LATEST sighting = the departure, the event
-        -- first stops are labelled by in training (build_delay_dataset.py).
-        -- For other stops the CASE is NULL on every row, so the tie-break
-        -- recorded_at ASC decides, exactly as before.
+        -- Earliest sighting after the prediction = the arrival; except for a
+        -- first-stop prediction made since FIRST_STOP_DEPARTURE_SINCE, where
+        -- the LATEST sighting = the departure, the event first stops are now
+        -- labelled by in training (build_delay_dataset.py). Otherwise the
+        -- CASE is NULL on every row, so recorded_at ASC decides as before.
         ORDER BY pl.id,
-                 CASE WHEN pl.stop_sequence = 1 THEN vs.recorded_at END DESC NULLS LAST,
+                 CASE WHEN pl.stop_sequence = 1 AND pl.predicted_at >= %(departure_since)s
+                      THEN vs.recorded_at END DESC NULLS LAST,
                  vs.recorded_at ASC
     """
     with psycopg2.connect(**DB_CONFIG) as conn, conn.cursor() as cur:
-        cur.execute(query)
+        cur.execute(query, {"departure_since": FIRST_STOP_DEPARTURE_SINCE})
         rows = cur.fetchall()
 
     entries = []
