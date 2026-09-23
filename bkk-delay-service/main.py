@@ -649,10 +649,18 @@ def vehicles_current_delays(request: CurrentDelaysRequest) -> CurrentDelaysRespo
     Unlike fetch_upstream_delay (used for a single vehicle's *own*
     prediction, which deliberately only looks *before* its current stop
     to avoid leaking the very thing being predicted), this wants the
-    single freshest confirmed observation for the whole trip today,
-    including its current stop if that's already been confirmed
-    STOPPED_AT/100% - there's no prediction to leak into here, just a
-    live status display.
+    freshest confirmed STOP for the whole trip today, including its
+    current stop if that's already been confirmed STOPPED_AT/100% -
+    there's no prediction to leak into here, just a live status display.
+
+    The delay at that stop is measured at the ARRIVAL (first sighting
+    there), or the DEPARTURE (last sighting) at a first stop - the same
+    definition as the training labels (build_delay_dataset.py). Until
+    2026-09-23 it used the latest sighting at any stop, so a vehicle
+    standing still (typically at the end of the line in the evening, still
+    showing its last trip) got one second "later" every second it stood
+    there: measured live, 33 red markers of which 26 were this, e.g. +61
+    min for a bus whose last real arrival was +3 min.
     """
     if schedule_lookup is None:
         raise HTTPException(status_code=503, detail="Schedule not loaded")
@@ -660,14 +668,24 @@ def vehicles_current_delays(request: CurrentDelaysRequest) -> CurrentDelaysRespo
         return CurrentDelaysResponse(delays={})
 
     query = """
-        SELECT DISTINCT ON (trip_id) trip_id, stop_sequence, recorded_at
-        FROM vehicle_position_snapshots
-        WHERE trip_id = ANY(%s) AND service_date = %s
-          AND status = 'STOPPED_AT' AND stop_distance_percent = 100
-        ORDER BY trip_id, recorded_at DESC
+        WITH latest AS (
+            SELECT DISTINCT ON (trip_id) trip_id, stop_sequence
+            FROM vehicle_position_snapshots
+            WHERE trip_id = ANY(%(trip_ids)s) AND service_date = %(service_date)s
+              AND status = 'STOPPED_AT' AND stop_distance_percent = 100
+            ORDER BY trip_id, recorded_at DESC
+        )
+        SELECT l.trip_id, l.stop_sequence,
+               CASE WHEN l.stop_sequence = 1 THEN MAX(v.recorded_at) ELSE MIN(v.recorded_at) END
+        FROM latest l
+        JOIN vehicle_position_snapshots v
+          ON v.trip_id = l.trip_id AND v.stop_sequence = l.stop_sequence
+         AND v.service_date = %(service_date)s
+         AND v.status = 'STOPPED_AT' AND v.stop_distance_percent = 100
+        GROUP BY l.trip_id, l.stop_sequence
     """
     with psycopg2.connect(**DB_CONFIG) as conn, conn.cursor() as cur:
-        cur.execute(query, (request.trip_ids, request.service_date))
+        cur.execute(query, {"trip_ids": request.trip_ids, "service_date": request.service_date})
         rows = cur.fetchall()
 
     delays: dict[str, UpstreamDelayReading] = {}
