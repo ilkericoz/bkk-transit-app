@@ -137,6 +137,65 @@ def fetch_scheduled_times(trip_ids: set[str]) -> pd.DataFrame:
     return scheduled
 
 
+# A vehicle ahead that passed longer ago than this isn't "the bus in front"
+# any more (e.g. the last run of the previous evening), so it's treated as
+# no vehicle ahead.
+VEHICLE_AHEAD_MAX_MINUTES = 60
+
+
+def add_vehicle_ahead(merged: pd.DataFrame) -> pd.DataFrame:
+    """
+    Vehicle-ahead features (added 2026-09-24, Phase 1 candidate): the
+    previous vehicle of the SAME route at the SAME stop (BKK stop_ids are
+    per direction), counted only if it got there before this trip's
+    upstream stop was confirmed (upstream_time) - the moment a live
+    prediction for this stop would be made. The live lookup must use the
+    same reference moment, not "now", or this becomes another train/serve
+    mismatch like the removed route_recent_delay.
+
+    ahead_delay_seconds    - that vehicle's delay at this very stop
+    minutes_since_ahead    - how long before upstream_time it got there
+    scheduled_gap_minutes  - timetable gap between the two trips here
+    has_vehicle_ahead      - 0 when none within VEHICLE_AHEAD_MAX_MINUTES,
+                             or when this row has no upstream stop yet
+
+    Bunching ("am I closer to the bus ahead than planned?") is exactly
+    upstream_delay_seconds - ahead_delay_seconds, so it needs no column.
+    """
+    arrivals = (
+        merged[["route_id", "stop_id", "actual_arrival", "scheduled_arrival", "gtfs_trip_id", "delay_seconds"]]
+        .rename(columns={"actual_arrival": "ahead_arrival", "scheduled_arrival": "ahead_scheduled",
+                         "gtfs_trip_id": "ahead_trip_id", "delay_seconds": "ahead_delay_seconds"})
+        .sort_values("ahead_arrival")
+    )
+    has_ref = merged["upstream_time"].notna()
+    left = merged.loc[has_ref, ["route_id", "stop_id", "upstream_time", "gtfs_trip_id", "scheduled_arrival"]]
+    left = left.reset_index().sort_values("upstream_time")
+    found = pd.merge_asof(
+        left, arrivals, left_on="upstream_time", right_on="ahead_arrival",
+        by=["route_id", "stop_id"], direction="backward", allow_exact_matches=False,
+    ).set_index("index")
+
+    minutes_since = (found["upstream_time"] - found["ahead_arrival"]).dt.total_seconds() / 60
+    valid = (
+        found["ahead_arrival"].notna()
+        & (found["ahead_trip_id"] != found["gtfs_trip_id"])  # a looping trip's own earlier visit
+        & (minutes_since <= VEHICLE_AHEAD_MAX_MINUTES)
+    )
+    merged["has_vehicle_ahead"] = 0
+    merged["ahead_delay_seconds"] = 0.0
+    merged["minutes_since_ahead"] = 0.0
+    merged["scheduled_gap_minutes"] = 0.0
+    idx = found.index[valid]
+    merged.loc[idx, "has_vehicle_ahead"] = 1
+    merged.loc[idx, "ahead_delay_seconds"] = found.loc[idx, "ahead_delay_seconds"]
+    merged.loc[idx, "minutes_since_ahead"] = minutes_since[valid]
+    merged.loc[idx, "scheduled_gap_minutes"] = (
+        (found.loc[idx, "scheduled_arrival"] - found.loc[idx, "ahead_scheduled"]).dt.total_seconds() / 60
+    )
+    return merged
+
+
 def build_dataset() -> pd.DataFrame:
     actual = fetch_actual_arrivals()
     print(f"Actual arrival observations: {len(actual)}")
@@ -207,6 +266,10 @@ def build_dataset() -> pd.DataFrame:
     )["delay_seconds"].shift(1)
     merged["has_upstream_delay"] = merged["upstream_delay_seconds"].notna().astype(int)
     merged["upstream_delay_seconds"] = merged["upstream_delay_seconds"].fillna(0.0)
+    # When this trip's upstream stop was confirmed = the moment a live
+    # prediction for this stop could have been made (see add_vehicle_ahead).
+    merged["upstream_time"] = merged.groupby(["gtfs_trip_id", "service_date"])["actual_arrival"].shift(1)
+    merged = add_vehicle_ahead(merged)
 
     # route_recent_delay_seconds/has_route_recent_delay (added 2026-09-14):
     # unlike upstream_delay_seconds (this SAME trip's own recent history),
@@ -268,6 +331,7 @@ def build_dataset() -> pd.DataFrame:
         "route_recent_delay_seconds", "has_route_recent_delay",
         "temperature_2m", "precipitation", "wind_speed_10m",
         "deviated", "label_event",
+        "has_vehicle_ahead", "ahead_delay_seconds", "minutes_since_ahead", "scheduled_gap_minutes",
     ]].rename(columns={"gtfs_trip_id": "trip_id"})
 
 
