@@ -50,12 +50,15 @@ CATEGORICAL_FEATURES = ["route_id", "vehicle_route_type", "stop_id"]
 # treating that the same as a confirmed on-time reading would be wrong.
 # See build_delay_dataset.py for how these are computed for training, and
 # main.py's /predict/from-vehicle for the equivalent live lookup.
-# route_recent_delay_seconds/has_route_recent_delay (added 2026-09-14): how
-# OTHER vehicles on this route were running in roughly the last 10 minutes -
-# fills the gap upstream_delay_seconds leaves for a trip's very first
-# observed stop (the ~7% of rows with has_upstream_delay=0), where this
-# trip has no history of its own yet but the route itself might already be
-# running behind.
+# route_recent_delay_seconds/has_route_recent_delay (how OTHER vehicles on
+# this route were running in the last 10 minutes) were features from
+# 2026-09-14 until 2026-09-24, then REMOVED: with first stops labelled by
+# departure, the controlled ablation showed the linear model is better
+# without them (-0.25 s, CI entirely below zero, 18/20 days), and live they
+# were computed differently from training (every snapshot in the window,
+# including vehicles waiting at first stops, vs one row per stop visit).
+# build_delay_dataset.py still writes the columns, so the experiment can be
+# repeated; results from before this change need the previous commit.
 #
 # temperature_2m/precipitation/wind_speed_10m (added 2026-09-14): Budapest
 # weather at this stop visit's scheduled hour (see weather.py) - a plausible
@@ -68,7 +71,6 @@ CATEGORICAL_FEATURES = ["route_id", "vehicle_route_type", "stop_id"]
 # predictor (a detour is a very direct cause of running late).
 NUMERIC_FEATURES = [
     "hour", "day_of_week", "stop_sequence", "upstream_delay_seconds", "has_upstream_delay",
-    "route_recent_delay_seconds", "has_route_recent_delay",
     "temperature_2m", "precipitation", "wind_speed_10m",
     "deviated",
 ]
@@ -183,8 +185,6 @@ class GbtDelayModel(BaseDelayModel):
             "stop_sequence": df["stop_sequence"],
             "upstream_delay_seconds": df["upstream_delay_seconds"],
             "has_upstream_delay": df["has_upstream_delay"],
-            "route_recent_delay_seconds": df["route_recent_delay_seconds"],
-            "has_route_recent_delay": df["has_route_recent_delay"],
             "temperature_2m": df["temperature_2m"],
             "precipitation": df["precipitation"],
             "wind_speed_10m": df["wind_speed_10m"],
