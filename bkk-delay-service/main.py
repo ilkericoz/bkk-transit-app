@@ -182,6 +182,12 @@ class DelayPredictionRequest(BaseModel):
     precipitation: float | None = None
     wind_speed_10m: float | None = None
     deviated: bool = False
+    # Optional vehicle-ahead features (see fetch_vehicle_ahead) - this
+    # endpoint has no trip to look them up for. Left unset = no vehicle ahead.
+    has_vehicle_ahead: bool = False
+    ahead_delay_seconds: float = 0.0
+    minutes_since_ahead: float = 0.0
+    scheduled_gap_minutes: float = 0.0
 
 
 class UpstreamDelayReading(BaseModel):
@@ -199,6 +205,9 @@ class UpstreamDelayReading(BaseModel):
     # "how long ago" for something the caller just typed in, unlike a live
     # lookup's actual recorded_at.
     minutes_ago: float | None = None
+    # When that upstream stop was confirmed - the reference moment for the
+    # vehicle-ahead lookup. Internal only, not sent to callers.
+    recorded_at: datetime | None = Field(default=None, exclude=True)
 
 
 class DelayPredictionResponse(BaseModel):
@@ -279,7 +288,67 @@ def fetch_upstream_delay(gtfs_trip_id: str, stop_sequence: int, service_date: st
     recorded_at = recorded_at.astimezone(BUDAPEST_TZ)
     delay_seconds = (recorded_at - scheduled).total_seconds()
     minutes_ago = (datetime.now(BUDAPEST_TZ) - recorded_at).total_seconds() / 60
-    return UpstreamDelayReading(delay_seconds=delay_seconds, minutes_ago=minutes_ago)
+    return UpstreamDelayReading(delay_seconds=delay_seconds, minutes_ago=minutes_ago, recorded_at=recorded_at)
+
+
+# Same limits as build_delay_dataset.py (VEHICLE_AHEAD_MAX_MINUTES,
+# MAX_ABS_DELAY_SECONDS) - the live lookup has to see exactly what training saw.
+VEHICLE_AHEAD_MAX_MINUTES = 60
+VEHICLE_AHEAD_MAX_ABS_DELAY_SECONDS = 3600
+NO_VEHICLE_AHEAD = {"has_vehicle_ahead": 0, "ahead_delay_seconds": 0.0,
+                    "minutes_since_ahead": 0.0, "scheduled_gap_minutes": 0.0}
+
+
+def fetch_vehicle_ahead(route_id: str, stop_id: str, gtfs_trip_id: str,
+                        own_scheduled_arrival: datetime, reference_time: datetime) -> dict:
+    """
+    Live equivalent of build_delay_dataset.add_vehicle_ahead (added
+    2026-09-24): the previous vehicle of the same route at the same stop
+    that got there before `reference_time` - the moment this trip's
+    upstream stop was confirmed, NOT now. Training used that moment, so
+    using "now" here would feed the model inputs it never saw (the kind of
+    train/serve mismatch that got route_recent_delay removed).
+
+    "Got there" uses the label definition: first sighting at the stop, or
+    the last one if that stop is the other trip's first stop (departure).
+    Candidates without a timetable entry, or with |delay| beyond the
+    training data's outlier limit, are skipped, as they never existed in
+    the training data either. ~50 ms at night on the live table.
+    """
+    query = """
+        SELECT trip_id, stop_sequence, service_date,
+               CASE WHEN stop_sequence = 1 THEN MAX(recorded_at) ELSE MIN(recorded_at) END AS arrived
+        FROM vehicle_position_snapshots
+        WHERE route_id = %(route)s AND stop_id = %(stop)s
+          AND status = 'STOPPED_AT' AND stop_distance_percent = 100
+          AND recorded_at >= %(since)s
+          AND trip_id <> %(own)s
+        GROUP BY trip_id, stop_sequence, service_date
+        ORDER BY arrived DESC
+    """
+    # Look a bit further back than the 60-min limit so a visit that started
+    # just before the window still gets its true first sighting.
+    since = reference_time - timedelta(minutes=VEHICLE_AHEAD_MAX_MINUTES + 15)
+    with psycopg2.connect(**DB_CONFIG) as conn, conn.cursor() as cur:
+        cur.execute(query, {"route": route_id, "stop": stop_id, "since": since, "own": f"BKK_{gtfs_trip_id}"})
+        rows = cur.fetchall()
+
+    for trip_id, stop_sequence, service_date, arrived in rows:
+        arrived = arrived.astimezone(BUDAPEST_TZ)
+        if arrived >= reference_time:
+            continue  # got there after our reference moment - not known yet
+        minutes_since = (reference_time - arrived).total_seconds() / 60
+        if minutes_since > VEHICLE_AHEAD_MAX_MINUTES:
+            break  # sorted newest first: everything further down is older still
+        scheduled = schedule_lookup.scheduled_arrival(trip_id.removeprefix("BKK_"), stop_sequence, service_date)
+        if scheduled is None:
+            continue
+        delay = (arrived - scheduled).total_seconds()
+        if abs(delay) > VEHICLE_AHEAD_MAX_ABS_DELAY_SECONDS:
+            continue
+        return {"has_vehicle_ahead": 1, "ahead_delay_seconds": delay, "minutes_since_ahead": minutes_since,
+                "scheduled_gap_minutes": (own_scheduled_arrival - scheduled).total_seconds() / 60}
+    return dict(NO_VEHICLE_AHEAD)
 
 
 def fetch_bkk_prediction(trip_id: str, stop_sequence: int, service_date: str) -> tuple[float, int] | None:
@@ -707,6 +776,10 @@ def predict(request: DelayPredictionRequest) -> DelayPredictionResponse:
         precipitation=request.precipitation if request.precipitation is not None else weather["precipitation"],
         wind_speed_10m=request.wind_speed_10m if request.wind_speed_10m is not None else weather["wind_speed_10m"],
         deviated=int(request.deviated),
+        has_vehicle_ahead=int(request.has_vehicle_ahead),
+        ahead_delay_seconds=request.ahead_delay_seconds,
+        minutes_since_ahead=request.minutes_since_ahead,
+        scheduled_gap_minutes=request.scheduled_gap_minutes,
     )
     last_confirmed_delay = (
         UpstreamDelayReading(delay_seconds=request.upstream_delay_seconds)
@@ -761,6 +834,12 @@ def run_prediction(request: LiveVehiclePredictionRequest, source: str) -> DelayP
         )
 
     upstream = fetch_upstream_delay(gtfs_trip_id, request.stop_sequence, request.service_date)
+    # No upstream stop = no reference moment, same as in training (rows
+    # without an upstream stop never get a vehicle ahead there).
+    ahead = (
+        fetch_vehicle_ahead(request.route_id, request.stop_id, gtfs_trip_id, scheduled_arrival, upstream.recorded_at)
+        if upstream is not None else dict(NO_VEHICLE_AHEAD)
+    )
     weather = live_weather.current()
 
     predicted_delay = model.predict_one(
@@ -776,6 +855,7 @@ def run_prediction(request: LiveVehiclePredictionRequest, source: str) -> DelayP
         precipitation=weather["precipitation"],
         wind_speed_10m=weather["wind_speed_10m"],
         deviated=int(request.deviated),
+        **ahead,
     )
     bkk_prediction = fetch_bkk_prediction(request.trip_id, request.stop_sequence, request.service_date)
     log_prediction(

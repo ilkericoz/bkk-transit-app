@@ -73,6 +73,12 @@ NUMERIC_FEATURES = [
     "hour", "day_of_week", "stop_sequence", "upstream_delay_seconds", "has_upstream_delay",
     "temperature_2m", "precipitation", "wind_speed_10m",
     "deviated",
+    # The vehicle ahead (added 2026-09-24): the previous vehicle of the same
+    # route at the same stop, as known when this trip's upstream stop was
+    # confirmed - see build_delay_dataset.add_vehicle_ahead (training) and
+    # main.py's fetch_vehicle_ahead (live), which must stay identical.
+    # Controlled test: -0.65 s MAE [-0.72, -0.58], better on 20/20 days.
+    "has_vehicle_ahead", "ahead_delay_seconds", "minutes_since_ahead", "scheduled_gap_minutes",
 ]
 ALL_FEATURES = CATEGORICAL_FEATURES + NUMERIC_FEATURES
 TARGET = "delay_seconds"
@@ -189,6 +195,10 @@ class GbtDelayModel(BaseDelayModel):
             "precipitation": df["precipitation"],
             "wind_speed_10m": df["wind_speed_10m"],
             "deviated": df["deviated"],
+            "has_vehicle_ahead": df["has_vehicle_ahead"],
+            "ahead_delay_seconds": df["ahead_delay_seconds"],
+            "minutes_since_ahead": df["minutes_since_ahead"],
+            "scheduled_gap_minutes": df["scheduled_gap_minutes"],
             "route_id_mean_delay": df["route_id"].map(self.route_mean_delay).fillna(self.global_mean_delay),
             "stop_id_mean_delay": df["stop_id"].map(self.stop_mean_delay).fillna(self.global_mean_delay),
         })
