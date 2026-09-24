@@ -58,7 +58,8 @@ FIRST_STOP_DEPARTURE_SINCE = "2026-09-23 13:56:30+02:00"
 MODEL_PERIODS = [
     ("GBT, arrival labels", None, "2026-09-23 13:56:30+02:00"),
     ("linear, departure labels", "2026-09-23 13:56:30+02:00", "2026-09-24 02:08:40+02:00"),
-    ("linear, without route's recent delay", "2026-09-24 02:08:40+02:00", None),
+    ("linear, without route's recent delay", "2026-09-24 02:08:40+02:00", "2026-09-24 16:52:06+02:00"),
+    ("linear + vehicle ahead", "2026-09-24 16:52:06+02:00", None),
 ]
 
 # Same reconciliation as main.py's /scoreboard: the earliest STOPPED_AT/100%
