@@ -17,6 +17,12 @@ Read-only: does not touch prediction_log, vehicle_position_snapshots, or
 
 Run any time after auto-sampling has been running a while (needs real
 time to pass for sampled vehicles to actually reach their target stop).
+
+Updated 2026-09-24 to match /scoreboard's current rules (predictions for a
+stop the vehicle had already reached are excluded; first-stop predictions
+made after the switch are scored on departure) and to report each
+production model period separately - the model changed twice on
+2026-09-23/24, and mixing periods would blur which model is being judged.
 """
 
 import os
@@ -44,8 +50,21 @@ DB_CONFIG = {
 # actually predicted against. Chosen from evidence on 2026-09-16, not guessed.
 MAX_ABS_RECONCILED_DELAY_SECONDS = 1500
 
-# Same "earliest STOPPED_AT/100% sighting after the prediction was made"
-# definition of actual arrival used everywhere else in this project.
+# Same as main.py's FIRST_STOP_DEPARTURE_SINCE - when first stops started
+# being predicted (and scored) by departure instead of arrival.
+FIRST_STOP_DEPARTURE_SINCE = "2026-09-23 13:56:30+02:00"
+
+# Production model periods, by deploy time (see the README changelog).
+MODEL_PERIODS = [
+    ("GBT, arrival labels", None, "2026-09-23 13:56:30+02:00"),
+    ("linear, departure labels", "2026-09-23 13:56:30+02:00", "2026-09-24 02:08:40+02:00"),
+    ("linear, without route's recent delay", "2026-09-24 02:08:40+02:00", None),
+]
+
+# Same reconciliation as main.py's /scoreboard: the earliest STOPPED_AT/100%
+# sighting after the prediction (the arrival) - or, for a first-stop
+# prediction made since FIRST_STOP_DEPARTURE_SINCE, the latest one (the
+# departure) - skipping predictions for a stop already reached.
 RECONCILE_QUERY = """
     SELECT DISTINCT ON (pl.id)
            pl.id, pl.trip_id, pl.route_id, pl.vehicle_route_type, pl.stop_sequence,
@@ -62,7 +81,17 @@ RECONCILE_QUERY = """
      AND vs.recorded_at > pl.predicted_at
     WHERE pl.source = 'auto'
       AND pl.bkk_predicted_delay_seconds IS NOT NULL
-    ORDER BY pl.id, vs.recorded_at ASC
+      AND ((pl.stop_sequence = 1 AND pl.predicted_at >= %(departure_since)s) OR NOT EXISTS (
+          SELECT 1 FROM vehicle_position_snapshots prior
+          WHERE prior.trip_id = pl.trip_id AND prior.stop_id = pl.stop_id
+            AND prior.stop_sequence = pl.stop_sequence AND prior.service_date = pl.service_date
+            AND prior.status = 'STOPPED_AT' AND prior.stop_distance_percent = 100
+            AND prior.recorded_at <= pl.predicted_at
+      ))
+    ORDER BY pl.id,
+             CASE WHEN pl.stop_sequence = 1 AND pl.predicted_at >= %(departure_since)s
+                  THEN vs.recorded_at END DESC NULLS LAST,
+             vs.recorded_at ASC
 """
 
 
@@ -77,7 +106,7 @@ def main() -> None:
             "SELECT count(*) AS n FROM prediction_log WHERE source = 'auto' "
             "AND bkk_predicted_delay_seconds IS NOT NULL", conn
         )["n"].iloc[0]
-        reconciled = pd.read_sql_query(RECONCILE_QUERY, conn)
+        reconciled = pd.read_sql_query(RECONCILE_QUERY, conn, params={"departure_since": FIRST_STOP_DEPARTURE_SINCE})
 
     print(f"{total_auto} auto-sampled rows logged, {total_with_bkk} carry a BKK prediction, "
           f"{len(reconciled)} reconciled so far (the rest haven't reached their target stop yet)")
@@ -108,23 +137,31 @@ def main() -> None:
     reconciled["bkk_error"] = (reconciled["bkk_predicted_delay_seconds"] - reconciled["actual_delay_seconds"]).abs()
     reconciled["we_won"] = reconciled["our_error"] < reconciled["bkk_error"]
 
-    print(f"\n{len(reconciled)} comparable reconciled predictions (absolute delay vs. schedule, seconds):")
-    print(f"  Our model - mean absolute error: {reconciled['our_error'].mean():.1f}s "
-          f"(median {reconciled['our_error'].median():.1f}s)")
-    print(f"  BKK's own prediction (GTFS-RT TripUpdates) - mean absolute error: {reconciled['bkk_error'].mean():.1f}s "
-          f"(median {reconciled['bkk_error'].median():.1f}s)")
-    print(f"  We were closer in {reconciled['we_won'].sum()}/{len(reconciled)} "
-          f"({reconciled['we_won'].mean() * 100:.0f}%) of comparisons")
-
-    print("\nBy vehicle type:")
-    by_type = reconciled.groupby("vehicle_route_type").agg(
-        n=("our_error", "size"),
-        our_mae=("our_error", "mean"),
-        bkk_mae=("bkk_error", "mean"),
-        we_won_rate=("we_won", "mean"),
-    ).sort_values("n", ascending=False)
-    by_type["we_won_rate"] = (by_type["we_won_rate"] * 100).round(0)
-    print(by_type.to_string(float_format=lambda x: f"{x:.1f}"))
+    predicted_at = pd.to_datetime(reconciled["predicted_at"], utc=True)
+    for label, start, end in MODEL_PERIODS:
+        in_period = pd.Series(True, index=reconciled.index)
+        if start:
+            in_period &= predicted_at >= pd.Timestamp(start)
+        if end:
+            in_period &= predicted_at < pd.Timestamp(end)
+        period = reconciled[in_period]
+        print(f"\n=== {label} ({start or 'start'} -> {end or 'now'}) ===")
+        if period.empty:
+            print("  no reconciled predictions yet")
+            continue
+        print(f"  {len(period)} comparable reconciled predictions (absolute delay vs. schedule):")
+        for who, col in (("Our model", "our_error"), ("BKK's own prediction", "bkk_error")):
+            err = period[col]
+            print(f"  {who:22s} MAE {err.mean():6.1f}s  median {err.median():5.1f}s  within 60s {(err <= 60).mean() * 100:3.0f}%")
+        print(f"  We were closer in {period['we_won'].sum()}/{len(period)} ({period['we_won'].mean() * 100:.0f}%)")
+        by_type = period.groupby("vehicle_route_type").agg(
+            n=("our_error", "size"),
+            our_mae=("our_error", "mean"),
+            bkk_mae=("bkk_error", "mean"),
+            we_won_rate=("we_won", "mean"),
+        ).sort_values("n", ascending=False)
+        by_type["we_won_rate"] = (by_type["we_won_rate"] * 100).round(0)
+        print(by_type.to_string(float_format=lambda x: f"{x:.1f}"))
 
 
 if __name__ == "__main__":
