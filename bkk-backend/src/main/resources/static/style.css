@@ -47,3 +47,31 @@ html, body, #map {
 #legend.hidden {
     display: none;
 }
+
+/* Delay / Accuracy switch at the top of the legend (added 2026-09-25). */
+.legend-tabs {
+    display: flex;
+    gap: 4px;
+    margin-bottom: 4px;
+}
+
+.legend-tab {
+    flex: 1;
+    padding: 2px 8px;
+    border: 1px solid #ccc;
+    border-radius: 3px;
+    background: #f5f5f5;
+    font: inherit;
+    cursor: pointer;
+}
+
+.legend-tab.active {
+    background: #333;
+    border-color: #333;
+    color: white;
+}
+
+.legend-note {
+    color: #666;
+    font-size: 12px;
+}

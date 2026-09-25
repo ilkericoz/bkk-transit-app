@@ -22,6 +22,7 @@ same way.
 """
 
 import asyncio
+import hashlib
 import logging
 import os
 import random
@@ -32,6 +33,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import psycopg2
+from psycopg2.extras import execute_values
 import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
@@ -128,12 +130,49 @@ SCOREBOARD_INDEX_DDL = """
 """
 
 
+# Every-stop predictions (added 2026-09-25): one row per (trip, stop) the
+# vehicle was heading to, predicted from what was known when its previous stop
+# was confirmed (reference_time) and graded once it arrives. Unlike
+# prediction_log (map clicks + a random sample), this covers every vehicle, so
+# it is both the map's "accuracy" colouring and an unbiased live measure that
+# matches the offline walk-forward setup. A new table only - nothing existing
+# changes. One row per target: re-processing the same event is a no-op.
+STOP_PREDICTIONS_DDL = """
+    CREATE TABLE IF NOT EXISTS stop_predictions (
+        id BIGSERIAL PRIMARY KEY,
+        trip_id VARCHAR(255) NOT NULL,
+        route_id VARCHAR(255),
+        vehicle_route_type VARCHAR(255),
+        stop_id VARCHAR(255) NOT NULL,
+        stop_sequence INTEGER NOT NULL,
+        service_date VARCHAR(255) NOT NULL,
+        reference_time TIMESTAMPTZ NOT NULL,
+        predicted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        predicted_delay_seconds DOUBLE PRECISION NOT NULL,
+        upstream_delay_seconds DOUBLE PRECISION,
+        has_vehicle_ahead INTEGER,
+        ahead_delay_seconds DOUBLE PRECISION,
+        model_version VARCHAR(32),
+        actual_recorded_at TIMESTAMPTZ,
+        actual_delay_seconds DOUBLE PRECISION,
+        UNIQUE (trip_id, service_date, stop_sequence)
+    );
+    CREATE INDEX IF NOT EXISTS idx_stop_predictions_ungraded
+        ON stop_predictions (reference_time) WHERE actual_recorded_at IS NULL;
+"""
+
+# First 12 hex chars of the model file's sha256 - stored with every
+# stop_predictions row, so results can always be split by the exact model.
+model_version: str | None = None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global model, schedule_lookup
+    global model, schedule_lookup, model_version
     if not MODEL_PATH.exists():
         raise RuntimeError(f"No trained model at {MODEL_PATH} - run scripts/train_model.py first.")
     model = BaseDelayModel.load(MODEL_PATH)
+    model_version = hashlib.sha256(MODEL_PATH.read_bytes()).hexdigest()[:12]
     schedule_lookup = ScheduleLookup()
 
     # Self-provisioning rather than a manual migration step - this table is
@@ -143,12 +182,15 @@ async def lifespan(app: FastAPI):
     with psycopg2.connect(**DB_CONFIG) as conn, conn.cursor() as cur:
         cur.execute(PREDICTION_LOG_DDL)
         cur.execute(SCOREBOARD_INDEX_DDL)
+        cur.execute(STOP_PREDICTIONS_DDL)
         conn.commit()
 
     sampler = asyncio.create_task(auto_sample_loop()) if AUTO_SAMPLE_ENABLED else None
+    stop_predictor = asyncio.create_task(stop_predictions_loop()) if STOP_PREDICTIONS_ENABLED else None
     yield
-    if sampler is not None:
-        sampler.cancel()
+    for task in (sampler, stop_predictor):
+        if task is not None:
+            task.cancel()
 
 
 app = FastAPI(title="BKK Delay Prediction Service", lifespan=lifespan)
@@ -332,8 +374,21 @@ def fetch_vehicle_ahead(route_id: str, stop_id: str, gtfs_trip_id: str,
     with psycopg2.connect(**DB_CONFIG) as conn, conn.cursor() as cur:
         cur.execute(query, {"route": route_id, "stop": stop_id, "since": since, "own": f"BKK_{gtfs_trip_id}"})
         rows = cur.fetchall()
+    return pick_vehicle_ahead(rows, f"BKK_{gtfs_trip_id}", own_scheduled_arrival, reference_time)
 
-    for trip_id, stop_sequence, service_date, arrived in rows:
+
+def pick_vehicle_ahead(candidates, own_trip_id: str, own_scheduled_arrival: datetime,
+                       reference_time: datetime) -> dict:
+    """
+    The selection rule for the vehicle ahead, shared by the per-click lookup
+    (fetch_vehicle_ahead) and the every-stop grading job (predict_new_stops)
+    so the two can never drift apart. `candidates` are (trip_id,
+    stop_sequence, service_date, arrived) visits at the target stop by the
+    same route, newest first.
+    """
+    for trip_id, stop_sequence, service_date, arrived in candidates:
+        if trip_id == own_trip_id:
+            continue
         arrived = arrived.astimezone(BUDAPEST_TZ)
         if arrived >= reference_time:
             continue  # got there after our reference moment - not known yet
@@ -669,6 +724,12 @@ class CurrentDelayReading(BaseModel):
     minutes_ago: float
     # Show this delay only while minutes_ago <= stale_after_minutes.
     stale_after_minutes: float
+    # The map's "accuracy" colouring (added 2026-09-25): predicted minus
+    # actual delay of this trip's most recently graded every-stop prediction
+    # (see stop_predictions_once), and how long ago it was graded. None when
+    # no prediction for this trip has been graded yet.
+    prediction_error_seconds: float | None = None
+    prediction_graded_minutes_ago: float | None = None
 
 
 class CurrentDelaysResponse(BaseModel):
@@ -733,6 +794,13 @@ def vehicles_current_delays(request: CurrentDelaysRequest) -> CurrentDelaysRespo
     with psycopg2.connect(**DB_CONFIG) as conn, conn.cursor() as cur:
         cur.execute(query, {"trip_ids": request.trip_ids, "service_date": request.service_date})
         rows = cur.fetchall()
+        cur.execute("""
+            SELECT DISTINCT ON (trip_id) trip_id, predicted_delay_seconds - actual_delay_seconds, actual_recorded_at
+            FROM stop_predictions
+            WHERE trip_id = ANY(%(trip_ids)s) AND service_date = %(service_date)s AND actual_recorded_at IS NOT NULL
+            ORDER BY trip_id, actual_recorded_at DESC
+        """, {"trip_ids": request.trip_ids, "service_date": request.service_date})
+        last_graded = {trip_id: (error, graded_at) for trip_id, error, graded_at in cur.fetchall()}
 
     delays: dict[str, CurrentDelayReading] = {}
     now = datetime.now(BUDAPEST_TZ)
@@ -762,6 +830,10 @@ def vehicles_current_delays(request: CurrentDelaysRequest) -> CurrentDelaysRespo
             minutes_ago=(now - recorded_at).total_seconds() / 60,
             stale_after_minutes=stale_after,
         )
+        if trip_id in last_graded:
+            error, graded_at = last_graded[trip_id]
+            delays[trip_id].prediction_error_seconds = error
+            delays[trip_id].prediction_graded_minutes_ago = (now - graded_at.astimezone(BUDAPEST_TZ)).total_seconds() / 60
     return CurrentDelaysResponse(delays=delays)
 
 
@@ -958,3 +1030,166 @@ async def auto_sample_loop() -> None:
         except Exception as exc:  # noqa: BLE001 - keep the loop alive across DB/network hiccups
             logger.warning("auto-sample: cycle failed (%s)", type(exc).__name__)
         await asyncio.sleep(AUTO_SAMPLE_INTERVAL_SECONDS)
+
+
+
+# ---------------------------------------------------------------- every-stop predictions
+# Added 2026-09-25. Every STOP_PREDICTIONS_INTERVAL_SECONDS, for each stop
+# visit confirmed since the last cycle (arrival = first sighting; at a first
+# stop, the departure = last sighting once the vehicle has been gone for a
+# minute), predict the vehicle's NEXT stop from exactly what was known at that
+# moment, and grade earlier predictions whose target has now been reached.
+# That is the offline walk-forward setup, live, for every vehicle - so its
+# error is directly comparable to the offline figure (no sampling bias), and
+# it gives the map an accuracy colour for nearly every vehicle. Bulk queries
+# and one batch predict per cycle: at rush hour ~500 stops get confirmed per
+# 30 s, far too many for one per-click lookup each.
+STOP_PREDICTIONS_ENABLED = os.environ.get("STOP_PREDICTIONS_ENABLED", "0") == "1"
+STOP_PREDICTIONS_INTERVAL_SECONDS = 30
+# A confirmed event is processed only once it is this old: long enough for a
+# first-stop departure to be final (the vehicle has not been seen there since).
+STOP_PREDICTIONS_SETTLE = timedelta(seconds=60)
+# How far back the event query looks, so a visit's first sighting (or a long
+# wait at a first stop) is fully inside the window.
+STOP_PREDICTIONS_LOOKBACK = timedelta(minutes=30)
+
+_stop_predictions_watermark: datetime | None = None
+
+STOP_EVENTS_QUERY = """
+    SELECT trip_id, route_id, vehicle_route_type, stop_sequence, service_date,
+           CASE WHEN stop_sequence = 1 THEN MAX(recorded_at) ELSE MIN(recorded_at) END AS event_time,
+           bool_or(COALESCE(deviated, false)) AS deviated
+    FROM vehicle_position_snapshots
+    WHERE recorded_at > %(window_start)s
+      AND status = 'STOPPED_AT' AND stop_distance_percent = 100
+      AND trip_id IS NOT NULL AND route_id IS NOT NULL AND stop_sequence IS NOT NULL
+      AND vehicle_route_type IS NOT NULL
+    GROUP BY trip_id, route_id, vehicle_route_type, stop_sequence, service_date
+    HAVING (CASE WHEN stop_sequence = 1 THEN MAX(recorded_at) ELSE MIN(recorded_at) END) > %(prev)s
+       AND (CASE WHEN stop_sequence = 1 THEN MAX(recorded_at) ELSE MIN(recorded_at) END) <= %(until)s
+"""
+
+# Candidate vehicles ahead for all target stops of this cycle in one query -
+# the same visits fetch_vehicle_ahead would find one stop at a time.
+STOP_AHEAD_CANDIDATES_QUERY = """
+    SELECT route_id, stop_id, trip_id, stop_sequence, service_date,
+           CASE WHEN stop_sequence = 1 THEN MAX(recorded_at) ELSE MIN(recorded_at) END AS arrived
+    FROM vehicle_position_snapshots
+    WHERE recorded_at >= %(since)s
+      AND status = 'STOPPED_AT' AND stop_distance_percent = 100
+      AND route_id = ANY(%(routes)s) AND stop_id = ANY(%(stops)s)
+    GROUP BY route_id, stop_id, trip_id, stop_sequence, service_date
+"""
+
+# Predictions whose target stop has now been reached: its first sighting
+# after the reference moment (targets are never a first stop, so arrival).
+STOP_GRADE_QUERY = """
+    SELECT sp.id, sp.trip_id, sp.stop_sequence, sp.service_date, MIN(vs.recorded_at) AS arrived
+    FROM stop_predictions sp
+    JOIN vehicle_position_snapshots vs
+      ON vs.trip_id = sp.trip_id AND vs.stop_id = sp.stop_id AND vs.stop_sequence = sp.stop_sequence
+     AND vs.service_date = sp.service_date AND vs.status = 'STOPPED_AT' AND vs.stop_distance_percent = 100
+     AND vs.recorded_at > sp.reference_time
+    WHERE sp.actual_recorded_at IS NULL AND sp.reference_time > now() - interval '3 hours'
+    GROUP BY sp.id, sp.trip_id, sp.stop_sequence, sp.service_date
+"""
+
+
+def stop_predictions_once() -> dict:
+    """One cycle: predict the next stop for newly confirmed stop events, then
+    grade whatever has been reached. Blocking (DB), run in a worker thread."""
+    global _stop_predictions_watermark
+    import pandas as pd
+
+    until = datetime.now(BUDAPEST_TZ) - STOP_PREDICTIONS_SETTLE
+    prev = _stop_predictions_watermark or until - timedelta(seconds=STOP_PREDICTIONS_INTERVAL_SECONDS)
+    with psycopg2.connect(**DB_CONFIG) as conn, conn.cursor() as cur:
+        cur.execute(STOP_EVENTS_QUERY, {"window_start": prev - STOP_PREDICTIONS_LOOKBACK, "prev": prev, "until": until})
+        events = cur.fetchall()
+
+        # The next-stop feature row for each event, built like a click's.
+        targets = []
+        for trip_id, route_id, vehicle_route_type, seq, service_date, event_time, deviated in events:
+            gtfs_trip_id = trip_id.removeprefix("BKK_")
+            scheduled_here = schedule_lookup.scheduled_arrival(gtfs_trip_id, seq, service_date)
+            next_stop = schedule_lookup.stop_id_at(gtfs_trip_id, seq + 1)
+            scheduled_next = schedule_lookup.scheduled_arrival(gtfs_trip_id, seq + 1, service_date)
+            if scheduled_here is None or next_stop is None or scheduled_next is None:
+                continue  # not on BKK's timetable, or this was the trip's last stop
+            event_time = event_time.astimezone(BUDAPEST_TZ)
+            upstream_delay = (event_time - scheduled_here).total_seconds()
+            if abs(upstream_delay) > VEHICLE_AHEAD_MAX_ABS_DELAY_SECONDS:
+                continue  # training drops such rows, so they never act as an upstream stop
+            targets.append({"trip_id": trip_id, "route_id": route_id, "vehicle_route_type": vehicle_route_type,
+                            "stop_id": f"BKK_{next_stop}", "stop_sequence": seq + 1, "service_date": service_date,
+                            "reference_time": event_time, "scheduled_arrival": scheduled_next,
+                            "upstream_delay_seconds": upstream_delay, "deviated": int(deviated)})
+
+        predicted_count = 0
+        if targets:
+            cur.execute(STOP_AHEAD_CANDIDATES_QUERY, {
+                "since": min(t["reference_time"] for t in targets) - timedelta(minutes=VEHICLE_AHEAD_MAX_MINUTES + 15),
+                "routes": sorted({t["route_id"] for t in targets}),
+                "stops": sorted({t["stop_id"] for t in targets}),
+            })
+            by_stop: dict[tuple[str, str], list] = {}
+            for route_id, stop_id, trip_id, seq, service_date, arrived in cur.fetchall():
+                by_stop.setdefault((route_id, stop_id), []).append((trip_id, seq, service_date, arrived))
+            for visits in by_stop.values():
+                visits.sort(key=lambda v: v[3], reverse=True)  # newest first, like fetch_vehicle_ahead
+
+            weather = live_weather.current()
+            rows = []
+            for t in targets:
+                ahead = pick_vehicle_ahead(by_stop.get((t["route_id"], t["stop_id"]), []), t["trip_id"],
+                                           t["scheduled_arrival"], t["reference_time"])
+                rows.append({**t, **ahead, "has_upstream_delay": 1,
+                             "hour": t["scheduled_arrival"].hour, "day_of_week": t["scheduled_arrival"].weekday(),
+                             "temperature_2m": weather["temperature_2m"], "precipitation": weather["precipitation"],
+                             "wind_speed_10m": weather["wind_speed_10m"]})
+            predicted = model.predict(pd.DataFrame(rows)).to_numpy()
+            execute_values(cur, """
+                INSERT INTO stop_predictions (trip_id, route_id, vehicle_route_type, stop_id, stop_sequence,
+                    service_date, reference_time, predicted_delay_seconds, upstream_delay_seconds,
+                    has_vehicle_ahead, ahead_delay_seconds, model_version)
+                VALUES %s ON CONFLICT (trip_id, service_date, stop_sequence) DO NOTHING
+            """, [(r["trip_id"], r["route_id"], r["vehicle_route_type"], r["stop_id"], r["stop_sequence"],
+                   r["service_date"], r["reference_time"], float(p), r["upstream_delay_seconds"],
+                   r["has_vehicle_ahead"], r["ahead_delay_seconds"], model_version)
+                  for r, p in zip(rows, predicted)])
+            conn.commit()
+            predicted_count = len(rows)
+
+        _stop_predictions_watermark = until
+        return {"events": len(events), "predicted": predicted_count, **grade_stop_predictions(cur, conn)}
+
+
+def grade_stop_predictions(cur, conn) -> dict:
+    """Fill in the actual delay for predictions whose target stop was reached."""
+    cur.execute(STOP_GRADE_QUERY)
+    graded = []
+    for pred_id, trip_id, seq, service_date, arrived in cur.fetchall():
+        scheduled = schedule_lookup.scheduled_arrival(trip_id.removeprefix("BKK_"), seq, service_date)
+        if scheduled is not None:
+            graded.append((pred_id, arrived, (arrived.astimezone(BUDAPEST_TZ) - scheduled).total_seconds()))
+    if graded:
+        execute_values(cur, """
+            UPDATE stop_predictions sp SET actual_recorded_at = g.arrived, actual_delay_seconds = g.delay
+            FROM (VALUES %s) AS g(id, arrived, delay) WHERE sp.id = g.id
+        """, graded, template="(%s, %s::timestamptz, %s::double precision)")
+        conn.commit()
+    return {"graded": len(graded)}
+
+
+async def stop_predictions_loop() -> None:
+    logger.info("stop-predictions: enabled, every %ds", STOP_PREDICTIONS_INTERVAL_SECONDS)
+    while True:
+        started = time.time()
+        try:
+            counts = await asyncio.to_thread(stop_predictions_once)
+            logger.info("stop-predictions: %s in %.1fs", counts, time.time() - started)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - keep the loop alive across DB hiccups
+            logger.warning("stop-predictions: cycle failed (%s: %s)", type(exc).__name__, exc)
+        await asyncio.sleep(max(1.0, STOP_PREDICTIONS_INTERVAL_SECONDS - (time.time() - started)))

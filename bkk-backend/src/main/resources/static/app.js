@@ -79,14 +79,51 @@ function delayColor(delaySeconds) {
     return bucket.color;
 }
 
+// Second colouring mode (added 2026-09-25), switched in the legend: how
+// far off our latest graded prediction for this vehicle was (predicted vs
+// actual delay at its next stop - see main.py's stop_predictions_once, which
+// predicts every vehicle's next stop). Same colours as the delay scale, so
+// green still means "good" and red "bad".
+const ACCURACY_COLOR_BUCKETS = [
+    { max: 30, color: "#27ae60", label: "Within 30s" },
+    { max: 60, color: "#f1c40f", label: "30s-1 min off" },
+    { max: 120, color: "#e67e22", label: "1-2 min off" },
+    { max: Infinity, color: "#e74c3c", label: "2+ min off" },
+];
+
+function accuracyColor(errorSeconds) {
+    if (errorSeconds == null) {
+        return NO_DELAY_DATA_COLOR;
+    }
+    return ACCURACY_COLOR_BUCKETS.find((b) => Math.abs(errorSeconds) < b.max).color;
+}
+
+// "delay" or "accuracy". Remembered per browser; storage can be unavailable
+// (private window, blocked site data), so every access is guarded.
+let colorMode = "delay";
+try {
+    colorMode = localStorage.getItem("colorMode") === "accuracy" ? "accuracy" : "delay";
+} catch (e) { /* default stays */ }
+
 function markerStyleFor(vehicle) {
     if (!vehicle.tripId) {
         return { color: OUT_OF_SERVICE_COLOR, fillOpacity: OUT_OF_SERVICE_FILL_OPACITY };
     }
     const confirmed = currentDelaysByTrip.get(tripKey(vehicle.serviceDate, vehicle.tripId));
     const fresh = confirmed && confirmed.minutesAgo <= (confirmed.staleAfterMinutes ?? MAX_DELAY_AGE_MINUTES);
-    const color = delayColor(fresh ? confirmed.delaySeconds : null);
+    const color = colorMode === "accuracy"
+        ? accuracyColor(fresh ? confirmed.predictionErrorSeconds : null)
+        : delayColor(fresh ? confirmed.delaySeconds : null);
     return { color, fillOpacity: IN_SERVICE_FILL_OPACITY };
+}
+
+function restyleAllMarkers() {
+    for (const [id, marker] of markersById) {
+        const vehicle = vehiclesById.get(id);
+        if (!vehicle) continue;
+        const { color, fillOpacity } = markerStyleFor(vehicle);
+        marker.setStyle({ color, fillColor: color, fillOpacity });
+    }
 }
 
 // Keyed by serviceDate + tripId, not tripId alone - BKK reuses the same
@@ -419,15 +456,33 @@ function refreshVehicles() {
 Promise.all([loadRoutes(), loadStops()]).then(refreshVehicles);
 setInterval(refreshVehicles, POLL_INTERVAL_MS);
 
-// Static legend for the delay color scale above - rendered once, not
-// polled (the scale itself never changes).
+// Legend for the current colour mode, with a Delay / Accuracy switch -
+// re-rendered only when the mode changes.
 function renderLegend() {
     const el = document.getElementById("legend");
     const swatch = (color) => `<span style="display:inline-block;width:10px;height:10px;background:${color};margin-right:6px;border-radius:2px;"></span>`;
-    const rows = DELAY_COLOR_BUCKETS.map((b) => `${swatch(b.color)}${b.label}<br>`).join("");
-    el.innerHTML = `<strong>Delay</strong><br>${rows}${swatch(NO_DELAY_DATA_COLOR)}No recent data<br>${swatch(OUT_OF_SERVICE_COLOR)}Out of service`;
+    const accuracy = colorMode === "accuracy";
+    const buckets = accuracy ? ACCURACY_COLOR_BUCKETS : DELAY_COLOR_BUCKETS;
+    const rows = buckets.map((b) => `${swatch(b.color)}${b.label}<br>`).join("");
+    const noData = accuracy ? "No graded prediction yet" : "No recent data";
+    const tab = (mode, label) =>
+        `<button type="button" data-mode="${mode}" class="legend-tab${colorMode === mode ? " active" : ""}">${label}</button>`;
+    el.innerHTML = `<div class="legend-tabs">${tab("delay", "Delay")}${tab("accuracy", "Accuracy")}</div>`
+        + (accuracy ? `<div class="legend-note">Our last prediction vs reality</div>` : "")
+        + `${rows}${swatch(NO_DELAY_DATA_COLOR)}${noData}<br>${swatch(OUT_OF_SERVICE_COLOR)}Out of service`;
     el.classList.remove("hidden");
 }
+
+document.getElementById("legend").addEventListener("click", (event) => {
+    const mode = event.target.dataset?.mode;
+    if (!mode || mode === colorMode) return;
+    colorMode = mode;
+    try {
+        localStorage.setItem("colorMode", mode);
+    } catch (e) { /* not remembered, still switched */ }
+    renderLegend();
+    restyleAllMarkers();
+});
 
 renderLegend();
 

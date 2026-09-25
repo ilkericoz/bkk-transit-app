@@ -72,6 +72,11 @@ services:
       AUTO_SAMPLE_ENABLED: "1"
       AUTO_SAMPLE_INTERVAL_SECONDS: "300"
       AUTO_SAMPLE_SIZE: "50"
+      # Added 2026-09-25: predict every vehicle's next stop the moment its
+      # previous stop is confirmed, and grade it on arrival (stop_predictions
+      # table) - the map's accuracy colours and an unbiased live error.
+      # Set to "0" to turn it off.
+      STOP_PREDICTIONS_ENABLED: "1"
       # OpenBLAS/OpenMP default to one scratch-arena thread per logical core,
       # which only adds thread-pool sync overhead on a single-row /predict -
       # measured ~27% lower median / ~35% lower p95 latency capped to 1 vs the
