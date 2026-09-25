@@ -278,7 +278,13 @@ function lastStopSection(vehicle) {
     const title = here ? "Now at" : "Last stop";
     const ago = here ? "" : ` (${Math.round(confirmed.minutesAgo)} min ago)`;
     let lines = `Actual: ${formatDelay(confirmed.delaySeconds)}`;
-    if (confirmed.gradedPredictedSeconds != null) {
+    if (confirmed.gradedPredictedSeconds == null) {
+        // Nothing graded yet - typically a trip that has just left its first
+        // stop, which is never predicted (there is no earlier stop to predict
+        // from). Say so, rather than leave a grey Accuracy marker unexplained.
+        lines += `<br><span class="popup-muted">No graded prediction yet - our prediction for the next stop `
+            + `is checked when the vehicle gets there</span>`;
+    } else {
         const off = Math.round(confirmed.gradedPredictedSeconds - confirmed.gradedActualSeconds);
         const verdict = Math.abs(off) < 1 ? "spot on" : `${Math.abs(off)} s too ${off > 0 ? "high" : "low"}`;
         if (confirmed.gradedStopId === confirmed.stopId) {
