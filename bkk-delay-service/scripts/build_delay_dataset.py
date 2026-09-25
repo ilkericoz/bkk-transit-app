@@ -39,6 +39,7 @@ import os
 import sys
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import psycopg2
 
@@ -124,7 +125,14 @@ def fetch_scheduled_times(trip_ids: set[str]) -> pd.DataFrame:
     """
     # Current timetable plus retired trips it no longer has (see
     # gtfs_schedule.RETIRED_STOP_TIMES_PATH) - past days must stay resolvable.
-    return read_stop_times(["trip_id", "stop_sequence", "arrival_time"], trip_ids=trip_ids)
+    scheduled = read_stop_times(["trip_id", "stop_sequence", "arrival_time", "stop_id"], trip_ids=trip_ids)
+    # The scheduled PREVIOUS stop of every stop visit (for add_segment_recent),
+    # in the live feed's "BKK_" + stop_id form. Stop numbers run 1..n without
+    # gaps in every BKK trip, so "previous" is simply stop_sequence - 1.
+    scheduled = scheduled.sort_values(["trip_id", "stop_sequence"])
+    previous = scheduled.groupby("trip_id")["stop_id"].shift(1)
+    scheduled["scheduled_prev_stop_id"] = ("BKK_" + previous).where(previous.notna())
+    return scheduled.drop(columns=["stop_id"])
 
 
 # A vehicle ahead that passed longer ago than this isn't "the bus in front"
@@ -183,6 +191,63 @@ def add_vehicle_ahead(merged: pd.DataFrame) -> pd.DataFrame:
     merged.loc[idx, "scheduled_gap_minutes"] = (
         (found.loc[idx, "scheduled_arrival"] - found.loc[idx, "ahead_scheduled"]).dt.total_seconds() / 60
     )
+    return merged
+
+
+# How far back the live-traffic feature looks (see add_segment_recent).
+SEGMENT_RECENT_MINUTES = 15
+
+
+def add_segment_recent(merged: pd.DataFrame) -> pd.DataFrame:
+    """
+    Recent traffic on the stretch into this stop (added 2026-09-25, Phase 1
+    candidate): how much delay vehicles of ANY route gained on the same
+    stop-to-stop stretch (this stop's scheduled previous stop -> this stop)
+    in the SEGMENT_RECENT_MINUTES before this trip's upstream stop was
+    confirmed - the moment a live prediction is made. Errors cluster where
+    delay changes fast between stops (near Keleti on 25 Sep: 51 s MAE vs
+    25 s elsewhere), and nothing else in the model sees current traffic;
+    the vehicle ahead only covers the same route.
+
+    A "gain" = delay at stop B minus the same vehicle's delay at the stop
+    just before it (stop_sequence - 1), counted at its arrival at B. Rows
+    with has_upstream_delay = 0 get no value, like add_vehicle_ahead.
+
+    segment_recent_gain_seconds - mean gain on this stretch in the window
+    segment_recent_count        - how many vehicles that mean is over
+    has_segment_recent          - 0 when there were none
+    """
+    df = merged.sort_values(["gtfs_trip_id", "service_date", "stop_sequence"])
+    grouped = df.groupby(["gtfs_trip_id", "service_date"])
+    consecutive = grouped["stop_sequence"].shift(1) == df["stop_sequence"] - 1
+    gains = pd.DataFrame({
+        "segment": grouped["stop_id"].shift(1) + ">" + df["stop_id"],
+        "time": df["actual_arrival"],
+        "gain": df["delay_seconds"] - grouped["delay_seconds"].shift(1),
+    })[consecutive]
+
+    targets = merged[merged["upstream_time"].notna() & merged["scheduled_prev_stop_id"].notna()]
+    target_segment = targets["scheduled_prev_stop_id"] + ">" + targets["stop_id"]
+
+    # One sorted key per (segment, time) so every target's window is two
+    # binary searches: key = segment code * 1e7 + seconds since the start.
+    codes, _ = pd.factorize(pd.concat([gains["segment"], target_segment], ignore_index=True))
+    t0 = min(gains["time"].min(), targets["upstream_time"].min())
+    gain_key = codes[:len(gains)] * 1e7 + (gains["time"] - t0).dt.total_seconds().to_numpy()
+    order = np.argsort(gain_key, kind="stable")
+    gain_key = gain_key[order]
+    cumulative = np.concatenate([[0.0], np.cumsum(gains["gain"].to_numpy()[order])])
+    target_key = codes[len(gains):] * 1e7 + (targets["upstream_time"] - t0).dt.total_seconds().to_numpy()
+    hi = np.searchsorted(gain_key, target_key, side="left")  # strictly before the reference moment
+    lo = np.searchsorted(gain_key, target_key - SEGMENT_RECENT_MINUTES * 60, side="left")
+    count = hi - lo
+
+    merged["segment_recent_count"] = 0
+    merged["segment_recent_gain_seconds"] = 0.0
+    merged.loc[targets.index, "segment_recent_count"] = count
+    merged.loc[targets.index, "segment_recent_gain_seconds"] = np.where(
+        count > 0, (cumulative[hi] - cumulative[lo]) / np.maximum(count, 1), 0.0)
+    merged["has_segment_recent"] = (merged["segment_recent_count"] > 0).astype(int)
     return merged
 
 
@@ -260,6 +325,7 @@ def build_dataset() -> pd.DataFrame:
     # prediction for this stop could have been made (see add_vehicle_ahead).
     merged["upstream_time"] = merged.groupby(["gtfs_trip_id", "service_date"])["actual_arrival"].shift(1)
     merged = add_vehicle_ahead(merged)
+    merged = add_segment_recent(merged)
 
     # route_recent_delay_seconds/has_route_recent_delay (added 2026-09-14):
     # unlike upstream_delay_seconds (this SAME trip's own recent history),
@@ -322,6 +388,7 @@ def build_dataset() -> pd.DataFrame:
         "temperature_2m", "precipitation", "wind_speed_10m",
         "deviated", "label_event",
         "has_vehicle_ahead", "ahead_delay_seconds", "minutes_since_ahead", "scheduled_gap_minutes",
+        "has_segment_recent", "segment_recent_gain_seconds", "segment_recent_count",
     ]].rename(columns={"gtfs_trip_id": "trip_id"})
 
 
