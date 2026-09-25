@@ -659,6 +659,10 @@ class CurrentDelaysRequest(BaseModel):
 STALE_MIN_MINUTES = 10
 STALE_GRACE_MINUTES = 5
 
+# A first-stop sighting this recent means the vehicle is still standing there
+# (it's polled every ~15 s), i.e. it hasn't departed yet (added 2026-09-25).
+FIRST_STOP_STILL_THERE = timedelta(seconds=60)
+
 
 class CurrentDelayReading(BaseModel):
     delay_seconds: float
@@ -739,6 +743,13 @@ def vehicles_current_delays(request: CurrentDelaysRequest) -> CurrentDelaysRespo
             continue
         recorded_at = recorded_at.astimezone(BUDAPEST_TZ)
         delay = timedelta(seconds=(recorded_at - scheduled).total_seconds())
+        if stop_sequence == 1 and now - recorded_at <= FIRST_STOP_STILL_THERE:
+            # Still standing at its first stop, so it hasn't departed yet and
+            # "last seen" is just "now": a bus waiting for an 18:50 departure
+            # showed -102 s (blue, "early") at 18:48. Until it leaves, the
+            # honest reading is the delay so far: 0 before the scheduled
+            # departure, growing once that has passed.
+            delay = max(timedelta(0), now - scheduled)
         # Stop numbers run 1..n without gaps in every BKK trip (checked
         # 2026-09-24), so the next stop is simply +1; None = last stop.
         next_scheduled = schedule_lookup.scheduled_arrival(gtfs_trip_id, stop_sequence + 1, request.service_date)
