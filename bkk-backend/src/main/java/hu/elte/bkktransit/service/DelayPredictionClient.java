@@ -158,7 +158,11 @@ public class DelayPredictionClient {
             @JsonProperty("minutes_ago") double minutesAgo,
             @JsonProperty("stale_after_minutes") double staleAfterMinutes,
             @JsonProperty("prediction_error_seconds") Double predictionErrorSeconds,
-            @JsonProperty("prediction_graded_minutes_ago") Double predictionGradedMinutesAgo
+            @JsonProperty("prediction_graded_minutes_ago") Double predictionGradedMinutesAgo,
+            @JsonProperty("stop_id") String stopId,
+            @JsonProperty("graded_stop_id") String gradedStopId,
+            @JsonProperty("graded_predicted_seconds") Double gradedPredictedSeconds,
+            @JsonProperty("graded_actual_seconds") Double gradedActualSeconds
     ) {
     }
 
@@ -186,6 +190,8 @@ public class DelayPredictionClient {
                         Map.Entry::getKey,
                         e -> new CurrentDelay(e.getValue().delaySeconds(), e.getValue().minutesAgo(),
                                 e.getValue().staleAfterMinutes(), e.getValue().predictionErrorSeconds(),
-                                e.getValue().predictionGradedMinutesAgo())));
+                                e.getValue().predictionGradedMinutesAgo(), e.getValue().stopId(),
+                                e.getValue().gradedStopId(), e.getValue().gradedPredictedSeconds(),
+                                e.getValue().gradedActualSeconds())));
     }
 }

@@ -240,65 +240,68 @@ function statusLine(vehicle) {
 // in place once the fetch resolves rather than waiting for the next poll.
 const predictionsByVehicleId = new Map();
 
-function predictionLine(vehicle) {
-    if (!vehicle.tripId || !vehicle.stopId || vehicle.stopSequence == null) {
+// Popup (reworked 2026-09-25 - the old one showed three numbers from three
+// sources without saying which stop each belonged to). Two sections, each
+// number next to its stop's name:
+//   Next stop - our prediction for the stop the vehicle is heading to (the
+//               /delay-prediction call made when the popup opens).
+//   Last stop - what actually happened at the last confirmed stop, and what
+//               we had predicted for it. From /current-delays, the same data
+//               as the marker colour, so popup and colour can't disagree.
+function formatDelay(seconds) {
+    const total = Math.round(Math.abs(seconds));
+    const minutes = Math.floor(total / 60);
+    const text = minutes > 0 ? `${minutes} min ${total % 60} s` : `${total} s`;
+    return seconds >= 0 ? `${text} late` : `${text} early`;
+}
+
+function nextStopSection(vehicle) {
+    if (!vehicle.stopId || vehicle.stopSequence == null || vehicle.status === "STOPPED_AT") {
         return "";
     }
     const prediction = predictionsByVehicleId.get(vehicle.vehicleId);
-    if (!prediction) {
-        return "";
+    let text = "…";
+    if (prediction?.status === "error") {
+        text = "prediction service unavailable";
+    } else if (prediction && prediction.status !== "loading") {
+        text = prediction.available ? formatDelay(prediction.predictedDelaySeconds) : "n/a (trip not in our timetable)";
     }
-    if (prediction.status === "loading") {
-        return "<br>Predicted delay: …";
-    }
-    if (prediction.status === "error") {
-        return "<br>Predicted delay: (prediction service unavailable)";
-    }
-    if (!prediction.available) {
-        return "<br>Predicted delay: n/a (not on our imported schedule)";
-    }
-    return `<br>Predicted delay: ${Math.round(prediction.predictedDelaySeconds)}s` + lastConfirmedLine(prediction);
+    return `<div class="popup-section"><strong>Next stop:</strong> ${stopLabel(vehicle.stopId)}<br>Predicted: ${text}</div>`;
 }
 
-// Shows the vehicle's last CONFIRMED delay (genuine ground truth - an
-// actual observed arrival at an earlier stop) right next to the
-// prediction above, so it's easy to eyeball whether the prediction looks
-// reasonable given what this vehicle was *actually* doing a moment ago -
-// not a comparison the prediction itself can prove right or wrong (this
-// stop hasn't happened yet), just a sanity-check reference point.
-function lastConfirmedLine(prediction) {
-    const confirmed = prediction.lastConfirmedDelay;
-    if (!confirmed) {
-        return "<br>Last confirmed delay: n/a (no earlier reading available today)";
+function lastStopSection(vehicle) {
+    const confirmed = currentDelaysByTrip.get(tripKey(vehicle.serviceDate, vehicle.tripId));
+    if (!confirmed?.stopId) {
+        return `<div class="popup-section"><strong>Last stop:</strong> none confirmed yet today</div>`;
     }
-    const recency = confirmed.minutesAgo != null ? ` (${confirmed.minutesAgo.toFixed(1)} min ago)` : "";
-    return `<br>Last confirmed delay: ${Math.round(confirmed.delaySeconds)}s${recency}`;
+    const here = vehicle.status === "STOPPED_AT" && confirmed.stopId === vehicle.stopId;
+    const title = here ? "Now at" : "Last stop";
+    const ago = here ? "" : ` (${Math.round(confirmed.minutesAgo)} min ago)`;
+    let lines = `Actual: ${formatDelay(confirmed.delaySeconds)}`;
+    if (confirmed.gradedPredictedSeconds != null) {
+        const off = Math.round(confirmed.gradedPredictedSeconds - confirmed.gradedActualSeconds);
+        const verdict = Math.abs(off) < 1 ? "spot on" : `${Math.abs(off)} s too ${off > 0 ? "high" : "low"}`;
+        if (confirmed.gradedStopId === confirmed.stopId) {
+            lines += `<br>We predicted: ${formatDelay(confirmed.gradedPredictedSeconds)} (${verdict})`;
+        } else {
+            lines += `<br><span class="popup-muted">Earlier, at ${stopLabel(confirmed.gradedStopId)}: we predicted `
+                + `${formatDelay(confirmed.gradedPredictedSeconds)}, actual `
+                + `${formatDelay(confirmed.gradedActualSeconds)} (${verdict})</span>`;
+        }
+    }
+    return `<div class="popup-section"><strong>${title}:</strong> ${stopLabel(confirmed.stopId)}${ago}<br>${lines}</div>`;
 }
 
 function popupHtml(vehicle) {
     const label = vehicle.label || vehicle.vehicleId;
     const secondsAgo = Math.round(Date.now() / 1000 - vehicle.lastUpdateTime);
+    const stops = vehicle.tripId ? nextStopSection(vehicle) + lastStopSection(vehicle) : "";
     return `
         <strong>${label}</strong><br>
-        Route: ${routeLabel(vehicle)}<br>
-        Trip: ${vehicle.tripId ?? "n/a"}<br>
-        ${statusLine(vehicle)}<br>
-        Updated ${secondsAgo}s ago${predictionLine(vehicle)}${gradedLine(vehicle)}
+        Route ${routeLabel(vehicle)} · ${statusLine(vehicle)}<br>
+        <span class="popup-muted">Position ${secondsAgo}s ago · trip ${vehicle.tripId ?? "n/a"}</span>
+        ${stops}
     `;
-}
-
-// What the Accuracy colour is based on (added 2026-09-25): the latest graded
-// every-stop prediction for this trip - an EARLIER stop than the "Predicted
-// delay" line above, which is for the stop the vehicle is heading to now.
-function gradedLine(vehicle) {
-    if (!vehicle.tripId) return "";
-    const confirmed = currentDelaysByTrip.get(tripKey(vehicle.serviceDate, vehicle.tripId));
-    const error = confirmed?.predictionErrorSeconds;
-    if (error == null) return "<br>Last graded prediction: none yet";
-    const off = Math.round(Math.abs(error));
-    const direction = error > 0 ? "more" : "less";
-    const ago = Math.round(confirmed.predictionGradedMinutesAgo);
-    return `<br>Last graded prediction: off by ${off}s (we predicted ${off}s ${direction} delay than happened, ${ago} min ago)`;
 }
 
 // Called only when a vehicle's popup is actually opened (see 'popupopen'

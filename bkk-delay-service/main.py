@@ -730,6 +730,13 @@ class CurrentDelayReading(BaseModel):
     # no prediction for this trip has been graded yet.
     prediction_error_seconds: float | None = None
     prediction_graded_minutes_ago: float | None = None
+    # For the popup (added 2026-09-25), so every number can be shown next to
+    # the stop it belongs to: the stop the delay above was confirmed at, and
+    # the graded prediction's stop, predicted and actual delay.
+    stop_id: str | None = None
+    graded_stop_id: str | None = None
+    graded_predicted_seconds: float | None = None
+    graded_actual_seconds: float | None = None
 
 
 class CurrentDelaysResponse(BaseModel):
@@ -795,12 +802,13 @@ def vehicles_current_delays(request: CurrentDelaysRequest) -> CurrentDelaysRespo
         cur.execute(query, {"trip_ids": request.trip_ids, "service_date": request.service_date})
         rows = cur.fetchall()
         cur.execute("""
-            SELECT DISTINCT ON (trip_id) trip_id, predicted_delay_seconds - actual_delay_seconds, actual_recorded_at
+            SELECT DISTINCT ON (trip_id) trip_id, predicted_delay_seconds - actual_delay_seconds, actual_recorded_at,
+                   stop_id, predicted_delay_seconds, actual_delay_seconds
             FROM stop_predictions
             WHERE trip_id = ANY(%(trip_ids)s) AND service_date = %(service_date)s AND actual_recorded_at IS NOT NULL
             ORDER BY trip_id, actual_recorded_at DESC
         """, {"trip_ids": request.trip_ids, "service_date": request.service_date})
-        last_graded = {trip_id: (error, graded_at) for trip_id, error, graded_at in cur.fetchall()}
+        last_graded = {row[0]: row[1:] for row in cur.fetchall()}
 
     delays: dict[str, CurrentDelayReading] = {}
     now = datetime.now(BUDAPEST_TZ)
@@ -830,10 +838,15 @@ def vehicles_current_delays(request: CurrentDelaysRequest) -> CurrentDelaysRespo
             minutes_ago=(now - recorded_at).total_seconds() / 60,
             stale_after_minutes=stale_after,
         )
+        static_stop = schedule_lookup.stop_id_at(gtfs_trip_id, stop_sequence)
+        delays[trip_id].stop_id = f"BKK_{static_stop}" if static_stop else None
         if trip_id in last_graded:
-            error, graded_at = last_graded[trip_id]
+            error, graded_at, graded_stop, predicted, actual = last_graded[trip_id]
             delays[trip_id].prediction_error_seconds = error
             delays[trip_id].prediction_graded_minutes_ago = (now - graded_at.astimezone(BUDAPEST_TZ)).total_seconds() / 60
+            delays[trip_id].graded_stop_id = graded_stop
+            delays[trip_id].graded_predicted_seconds = predicted
+            delays[trip_id].graded_actual_seconds = actual
     return CurrentDelaysResponse(delays=delays)
 
 

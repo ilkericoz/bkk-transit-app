@@ -75,3 +75,16 @@ html, body, #map {
     color: #666;
     font-size: 12px;
 }
+
+/* Vehicle popup sections (added 2026-09-25): one per stop, so every number
+   sits next to the stop it belongs to. */
+.popup-section {
+    margin-top: 6px;
+    padding-top: 6px;
+    border-top: 1px solid #eee;
+}
+
+.popup-muted {
+    color: #777;
+    font-size: 12px;
+}

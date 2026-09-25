@@ -11,5 +11,7 @@ package hu.elte.bkktransit.service;
  * this trip's latest graded every-stop prediction, for the map's accuracy mode.
  */
 public record CurrentDelay(double delaySeconds, double minutesAgo, double staleAfterMinutes,
-                           Double predictionErrorSeconds, Double predictionGradedMinutesAgo) {
+                           Double predictionErrorSeconds, Double predictionGradedMinutesAgo,
+                           String stopId, String gradedStopId, Double gradedPredictedSeconds,
+                           Double gradedActualSeconds) {
 }
