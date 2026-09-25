@@ -122,8 +122,8 @@ def fetch_scheduled_times(trip_ids: set[str]) -> pd.DataFrame:
     Our observed trip_id set is a tiny fraction of a full day's scheduled
     trips, so this is far cheaper than a full in-memory load.
     """
-    # Current timetable plus older ones for trips it no longer has (see
-    # gtfs_schedule.FALLBACK_FEEDS) - past days' trips must stay resolvable.
+    # Current timetable plus retired trips it no longer has (see
+    # gtfs_schedule.RETIRED_STOP_TIMES_PATH) - past days must stay resolvable.
     return read_stop_times(["trip_id", "stop_sequence", "arrival_time"], trip_ids=trip_ids)
 
 

@@ -27,27 +27,27 @@ GTFS_DIR = Path(os.environ.get(
 ))
 STOP_TIMES_PATH = GTFS_DIR / "stop_times.txt"
 
-# Older timetables that are still consulted, newest first (added 2026-09-25),
-# as sibling folders of GTFS_DIR. BKK publishes timetable updates every few
-# days; the live feed follows the newest one, so GTFS_DIR must be kept current
-# (on 2026-09-25 an 11-Sep copy matched only 91.3% of live BKK trips vs 97.1%
-# for a fresh one). But a newer file also drops trips that ran in the past:
-# 9.7% of the 09-24 training rows were on trips missing from the 25-Sep file.
-# So the newest file wins, and older ones only fill in trips it doesn't have
-# (the 161k trips present in both had identical times, so no conflicts).
-FALLBACK_FEEDS = ["raw_2026-09-11"]
+# Trips that dropped out of past timetables (added 2026-09-25). BKK publishes
+# timetable updates every few days; the live feed follows the newest one, so
+# GTFS_DIR is kept current (scripts/update_gtfs.py, run daily). But a newer
+# timetable no longer contains trips that already ran - on 2026-09-25, 9.7% of
+# the training rows were on such trips - and past days must stay resolvable
+# for label rebuilds. So on every update, the stop_times rows of trips that
+# disappeared are appended to this one file; the current timetable always
+# wins, and this only fills in trips it lacks. One small file instead of one
+# folder per past version keeps startup time flat as updates accumulate.
+RETIRED_STOP_TIMES_PATH = GTFS_DIR.parent / "retired_stop_times.csv.gz"
 
 
 def stop_times_paths() -> list[Path]:
-    """The current stop_times.txt, then the fallback feeds that exist."""
-    fallbacks = [GTFS_DIR.parent / name / "stop_times.txt" for name in FALLBACK_FEEDS]
-    return [STOP_TIMES_PATH] + [path for path in fallbacks if path.exists()]
+    """The current stop_times.txt, then the retired-trips file if it exists."""
+    return [STOP_TIMES_PATH] + ([RETIRED_STOP_TIMES_PATH] if RETIRED_STOP_TIMES_PATH.exists() else [])
 
 
 def read_stop_times(usecols: list[str], trip_ids: set[str] | None = None) -> pd.DataFrame:
     """
-    stop_times rows from the current feed, plus - only for trips no newer
-    feed has - from the fallback feeds. Read in chunks, optionally keeping
+    stop_times rows from the current feed, plus - only for trips it doesn't
+    have - from the retired-trips file. Read in chunks, optionally keeping
     only `trip_ids`, so memory stays close to one feed's worth. All columns
     as strings except stop_sequence (int).
     """
@@ -104,7 +104,7 @@ class ScheduleLookup:
 
     def __init__(self):
         usecols = ["trip_id", "stop_id", "stop_sequence", "arrival_time", "departure_time"]
-        df = read_stop_times(usecols)  # current feed + older ones for trips it lacks
+        df = read_stop_times(usecols)  # current feed + retired trips it lacks
         # trip_id + stop_sequence together uniquely identify one scheduled
         # stop visit within one trip (see build_delay_dataset.py's
         # docstring) - indexing by that pair gives fast lookups without the
