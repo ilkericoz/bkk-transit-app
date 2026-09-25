@@ -283,8 +283,22 @@ function popupHtml(vehicle) {
         Route: ${routeLabel(vehicle)}<br>
         Trip: ${vehicle.tripId ?? "n/a"}<br>
         ${statusLine(vehicle)}<br>
-        Updated ${secondsAgo}s ago${predictionLine(vehicle)}
+        Updated ${secondsAgo}s ago${predictionLine(vehicle)}${gradedLine(vehicle)}
     `;
+}
+
+// What the Accuracy colour is based on (added 2026-09-25): the latest graded
+// every-stop prediction for this trip - an EARLIER stop than the "Predicted
+// delay" line above, which is for the stop the vehicle is heading to now.
+function gradedLine(vehicle) {
+    if (!vehicle.tripId) return "";
+    const confirmed = currentDelaysByTrip.get(tripKey(vehicle.serviceDate, vehicle.tripId));
+    const error = confirmed?.predictionErrorSeconds;
+    if (error == null) return "<br>Last graded prediction: none yet";
+    const off = Math.round(Math.abs(error));
+    const direction = error > 0 ? "more" : "less";
+    const ago = Math.round(confirmed.predictionGradedMinutesAgo);
+    return `<br>Last graded prediction: off by ${off}s (we predicted ${off}s ${direction} delay than happened, ${ago} min ago)`;
 }
 
 // Called only when a vehicle's popup is actually opened (see 'popupopen'
