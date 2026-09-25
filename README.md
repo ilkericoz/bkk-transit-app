@@ -162,6 +162,15 @@ docker compose up --build -d
 
 Postgres itself runs natively (a Windows/Linux service), not in Compose — see `docker-compose.yml`'s header comment for why: it already survives reboots on its own, and containerizing it would mean migrating tens of millions of real accumulated rows for a mostly cosmetic "one compose file" story.
 
+**Keeping the timetable current.** BKK updates its GTFS timetable every few days; `bkk-delay-service/scripts/update_gtfs.py` installs new versions safely (checks, retired trips kept, restart, automatic rollback — see its docstring). On Windows, schedule it once from PowerShell:
+
+```powershell
+$action = New-ScheduledTaskAction -Execute "<repo>\bkk-delay-service\scripts\update_gtfs.cmd"
+Register-ScheduledTask -TaskName "BKK timetable update" -Action $action `
+  -Trigger (New-ScheduledTaskTrigger -Daily -At 4:30am) `
+  -Settings (New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 30))
+```
+
 ## Known limitations
 
 - Cold-start prediction (a trip's very first observed stop, ~7% of cases) is measurably worse than mid-trip prediction — a likely structural limit without a new data source (e.g. dispatch/shift-start data).
@@ -172,6 +181,8 @@ Postgres itself runs natively (a Windows/Linux service), not in Compose — see 
 ## Changelog
 
 Notable fixes and changes, most recent first (full history: `git log`).
+
+- **2026-09-25** — The timetable now updates itself. `bkk-delay-service/scripts/update_gtfs.py` runs daily at 04:30 (Windows Task Scheduler) and only acts when BKK has published a new version: it checks the new file (complete, not expired, and it must recognise at least as many live BKK trips as the current one), keeps the trips that drop out of it in `retired_stop_times.csv.gz` so past days stay resolvable, installs it, restarts both services, and rolls back automatically if the prediction service doesn't come back healthy. One retired-trips file instead of one folder per old version keeps service startup time flat as updates accumulate. Tested end to end in a sandbox (an 11-Sep → 25-Sep update: live trips recognised 91.0% → 97.1%) and with a forced rollback. Log: `bkk-backend/gtfs-data/update_log.txt`.
 
 - **2026-09-25** — Timetable updated, and older timetables are now kept alongside it. The imported BKK timetable was from 11 Sep; BKK changed parts of it around 18–20 Sep (new trips on lines such as 85, 70, 990, 133E, plus replacement services), so the share of live BKK trips it recognised fell from 96–97% to 91–92% — those vehicles got no prediction, no training label and no map colour. Updated to BKK's 25 Sep feed (97.1% recognised). A plain swap would have been a trap: the new file no longer contains trips that already ran — 9.7% of the existing training rows — so the next training-data rebuild would silently have lost them. The newest timetable now wins, and older ones fill in only trips it lacks (the 161,094 trips present in both had identical times). Live: unrecognised BKK trips on the map 100 → 36.
 - **2026-09-25** — The vehicle popup now explains the Accuracy colour: "Last graded prediction: off by 53s (we predicted 53s more delay than happened, 8 min ago)". The colour refers to an *earlier* stop than the popup's "Predicted delay", which caused confusion.
