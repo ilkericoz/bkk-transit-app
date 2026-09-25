@@ -43,7 +43,7 @@ import pandas as pd
 import psycopg2
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from gtfs_schedule import BUDAPEST_TZ, STOP_TIMES_PATH, to_scheduled_datetime
+from gtfs_schedule import BUDAPEST_TZ, read_stop_times, to_scheduled_datetime
 from weather import fetch_historical_hourly
 
 # Rows beyond this are dropped as outliers, not delay. Investigated a batch
@@ -122,19 +122,9 @@ def fetch_scheduled_times(trip_ids: set[str]) -> pd.DataFrame:
     Our observed trip_id set is a tiny fraction of a full day's scheduled
     trips, so this is far cheaper than a full in-memory load.
     """
-    matches = []
-    usecols = ["trip_id", "stop_sequence", "arrival_time"]
-    for chunk in pd.read_csv(STOP_TIMES_PATH, usecols=usecols, dtype=str, chunksize=500_000):
-        chunk = chunk[chunk["trip_id"].isin(trip_ids)]
-        if not chunk.empty:
-            matches.append(chunk)
-
-    if not matches:
-        return pd.DataFrame(columns=usecols)
-
-    scheduled = pd.concat(matches, ignore_index=True)
-    scheduled["stop_sequence"] = scheduled["stop_sequence"].astype(int)
-    return scheduled
+    # Current timetable plus older ones for trips it no longer has (see
+    # gtfs_schedule.FALLBACK_FEEDS) - past days' trips must stay resolvable.
+    return read_stop_times(["trip_id", "stop_sequence", "arrival_time"], trip_ids=trip_ids)
 
 
 # A vehicle ahead that passed longer ago than this isn't "the bus in front"

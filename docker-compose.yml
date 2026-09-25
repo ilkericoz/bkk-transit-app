@@ -44,7 +44,9 @@ services:
       # writes it. GTFS_DATA_DIR (see gtfs_schedule.py) points it at the
       # mount instead of the relative-path traversal used natively, since
       # the two services aren't laid out as disk siblings inside containers.
-      - ./bkk-backend/gtfs-data/raw:/gtfs-data:ro
+      # The whole gtfs-data folder (not just raw/) since 2026-09-25, so the
+      # older timetables in gtfs_schedule.FALLBACK_FEEDS are visible too.
+      - ./bkk-backend/gtfs-data:/gtfs-root:ro
       # The trained model and its training data are gitignored/regenerable,
       # and deliberately NOT baked into the image (see Dockerfile) - mounted
       # here so retraining on the host (scripts/train_model.py, still a
@@ -53,7 +55,7 @@ services:
       - ./bkk-delay-service/models:/app/models
       - ./bkk-delay-service/data:/app/data
     environment:
-      GTFS_DATA_DIR: /gtfs-data
+      GTFS_DATA_DIR: /gtfs-root/raw
       # Added for the upstream-delay feature (2026-09-12) - main.py now
       # queries Postgres live (vehicle_position_snapshots) on every
       # /predict/from-vehicle call, not just at training time.

@@ -27,6 +27,50 @@ GTFS_DIR = Path(os.environ.get(
 ))
 STOP_TIMES_PATH = GTFS_DIR / "stop_times.txt"
 
+# Older timetables that are still consulted, newest first (added 2026-09-25),
+# as sibling folders of GTFS_DIR. BKK publishes timetable updates every few
+# days; the live feed follows the newest one, so GTFS_DIR must be kept current
+# (on 2026-09-25 an 11-Sep copy matched only 91.3% of live BKK trips vs 97.1%
+# for a fresh one). But a newer file also drops trips that ran in the past:
+# 9.7% of the 09-24 training rows were on trips missing from the 25-Sep file.
+# So the newest file wins, and older ones only fill in trips it doesn't have
+# (the 161k trips present in both had identical times, so no conflicts).
+FALLBACK_FEEDS = ["raw_2026-09-11"]
+
+
+def stop_times_paths() -> list[Path]:
+    """The current stop_times.txt, then the fallback feeds that exist."""
+    fallbacks = [GTFS_DIR.parent / name / "stop_times.txt" for name in FALLBACK_FEEDS]
+    return [STOP_TIMES_PATH] + [path for path in fallbacks if path.exists()]
+
+
+def read_stop_times(usecols: list[str], trip_ids: set[str] | None = None) -> pd.DataFrame:
+    """
+    stop_times rows from the current feed, plus - only for trips no newer
+    feed has - from the fallback feeds. Read in chunks, optionally keeping
+    only `trip_ids`, so memory stays close to one feed's worth. All columns
+    as strings except stop_sequence (int).
+    """
+    frames, covered = [], set()
+    for path in stop_times_paths():
+        parts = []
+        for chunk in pd.read_csv(path, usecols=usecols, dtype=str, chunksize=500_000):
+            if trip_ids is not None:
+                chunk = chunk[chunk["trip_id"].isin(trip_ids)]
+            if covered:
+                chunk = chunk[~chunk["trip_id"].isin(covered)]
+            if not chunk.empty:
+                parts.append(chunk)
+        if parts:
+            feed = pd.concat(parts, ignore_index=True)
+            frames.append(feed)
+            covered |= set(feed["trip_id"])
+    if not frames:
+        return pd.DataFrame(columns=usecols)
+    df = pd.concat(frames, ignore_index=True)
+    df["stop_sequence"] = df["stop_sequence"].astype(int)
+    return df
+
 
 def to_scheduled_datetime(service_date: str, arrival_time: str) -> datetime:
     """
@@ -60,11 +104,7 @@ class ScheduleLookup:
 
     def __init__(self):
         usecols = ["trip_id", "stop_id", "stop_sequence", "arrival_time", "departure_time"]
-        df = pd.read_csv(
-            STOP_TIMES_PATH, usecols=usecols,
-            dtype={"trip_id": str, "stop_id": str, "arrival_time": str, "departure_time": str},
-        )
-        df["stop_sequence"] = df["stop_sequence"].astype(int)
+        df = read_stop_times(usecols)  # current feed + older ones for trips it lacks
         # trip_id + stop_sequence together uniquely identify one scheduled
         # stop visit within one trip (see build_delay_dataset.py's
         # docstring) - indexing by that pair gives fast lookups without the
