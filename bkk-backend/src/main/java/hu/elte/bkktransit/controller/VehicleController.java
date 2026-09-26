@@ -54,12 +54,10 @@ public class VehicleController {
         return delayPredictionClient.predict(request);
     }
 
-    // GET /api/vehicles/prediction-scoreboard - live accuracy stats,
-    // reconciling predictions we've already made against what actually
-    // happened (see PredictionScoreboard). Polled occasionally by the map
-    // page (see app.js) - predictions only reconcile once a vehicle
-    // actually reaches the stop, so there's no benefit to polling this as
-    // often as the 10s vehicle-position refresh.
+    // GET /api/vehicles/prediction-scoreboard - live accuracy of the current
+    // model, graded against what actually happened (see PredictionScoreboard).
+    // Polled every 30 s by the map page (see app.js); the sidecar caches the
+    // result for 60 s, so extra viewers don't add database load.
     @GetMapping("/prediction-scoreboard")
     public PredictionScoreboard predictionScoreboard() {
         return delayPredictionClient.scoreboard();

@@ -509,41 +509,41 @@ document.getElementById("legend").addEventListener("click", (event) => {
 
 renderLegend();
 
-// Live accuracy scoreboard - reconciles predictions already made against
-// what actually happened (see PredictionScoreboard on the Java side).
-// Polled far less often than vehicle positions: a prediction only
-// reconciles once the vehicle actually reaches the stop, so refreshing
-// this every 10s like the map would just re-fetch the same few numbers.
+// Live accuracy scoreboard - the current model's predictions graded
+// against what actually happened (see PredictionScoreboard on the Java
+// side): every vehicle's next stop, predicted when its previous stop is
+// confirmed. Polled far less often than vehicle positions: the numbers are
+// averages over many thousands of predictions and barely move in 10s.
 const SCOREBOARD_POLL_INTERVAL_MS = 30000;
+// Vehicle types with fewer graded predictions than this are left out of
+// the per-type lines - too few for a stable average.
+const SCOREBOARD_MIN_GROUP = 50;
+const VEHICLE_TYPE_NAMES = {
+    TRAM: "Tram", BUS: "Bus", TROLLEYBUS: "Trolleybus", SUBURBAN_RAILWAY: "HÉV",
+    SUBWAY: "Metro", RAIL: "Rail", FERRY: "Ferry", COACH: "Coach",
+};
 
 function scoreboardHtml(scoreboard) {
-    if (scoreboard.reconciledCount === 0) {
-        return "<strong>Live model accuracy</strong><br>No reconciled predictions yet - click a vehicle to make one, then check back once it reaches its next stop.";
+    if (scoreboard.gradedCount === 0) {
+        return "<strong>Live model accuracy</strong><br>No graded predictions for the current model yet - "
+            + "each vehicle's next stop is graded when it gets there, so this fills within minutes.";
     }
-    // Avg error is all-time (every reconciled prediction, not a rolling
-    // window) - a rolling window shows a different subset each poll as old
-    // entries fall out of it, which reads as the number moving around for
-    // no visible reason. All-time over a large N barely shifts per new
-    // sample, so it's both a truer number and a calmer one to watch.
     const mae = Math.round(scoreboard.meanAbsoluteErrorSeconds);
-    let html = `<strong>Live model accuracy</strong><br>Avg error: ${mae}s<br>Reconciled so far: ${scoreboard.reconciledCount}`;
-    if (scoreboard.best.length > 0) {
-        html += "<hr>Closest calls so far:<br>";
-        for (const entry of scoreboard.best) {
-            const predicted = Math.round(entry.predictedDelaySeconds);
-            const actual = Math.round(entry.actualDelaySeconds);
-            html += `${routeLabelFor(entry)}: predicted ${predicted}s, actual ${actual}s<br>`;
-        }
+    const within = Math.round(100 * scoreboard.within60sShare);
+    const persistence = Math.round(scoreboard.persistenceMaeSeconds);
+    const since = new Date(scoreboard.since).toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit" });
+    let html = "<strong>Live model accuracy</strong><br>"
+        + `Avg error: <strong>${mae}s</strong> &middot; ${within}% within 1 min<br>`
+        + `<span title="Error of just assuming the delay at the previous stop stays the same">`
+        + `Without the model: ${persistence}s</span><br>`
+        + `<small>${scoreboard.gradedCount.toLocaleString()} next-stop predictions graded since ${since}</small>`;
+    const groups = scoreboard.byVehicleType.filter((g) => g.gradedCount >= SCOREBOARD_MIN_GROUP);
+    if (groups.length > 1) {
+        html += "<hr>" + groups
+            .map((g) => `${VEHICLE_TYPE_NAMES[g.vehicleRouteType] || g.vehicleRouteType}: ${Math.round(g.meanAbsoluteErrorSeconds)}s`)
+            .join(" &middot; ");
     }
     return html;
-}
-
-// Separate from routeLabel(vehicle) above since a scoreboard entry isn't
-// shaped like a VehiclePosition (no "BKK_"-prefixed routeId lookup key
-// mismatch to worry about here - routeId already comes through as-is).
-function routeLabelFor(entry) {
-    const route = routesById.get(entry.routeId);
-    return route?.routeShortName || entry.routeId || "n/a";
 }
 
 function refreshScoreboard() {

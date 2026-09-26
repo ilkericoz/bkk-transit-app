@@ -111,27 +111,30 @@ public class DelayPredictionClient {
     }
 
     private record UpstreamScoreboardResponse(
-            @JsonProperty("reconciled_count") int reconciledCount,
+            @JsonProperty("model_version") String modelVersion,
+            @JsonProperty("since") String since,
+            @JsonProperty("graded_count") int gradedCount,
             @JsonProperty("mean_absolute_error_seconds") Double meanAbsoluteErrorSeconds,
-            @JsonProperty("best") List<UpstreamScoreboardEntry> best
+            @JsonProperty("within_60s_share") Double within60sShare,
+            @JsonProperty("persistence_mae_seconds") Double persistenceMaeSeconds,
+            @JsonProperty("by_vehicle_type") List<UpstreamScoreboardGroup> byVehicleType
     ) {
     }
 
-    private record UpstreamScoreboardEntry(
-            @JsonProperty("route_id") String routeId,
+    private record UpstreamScoreboardGroup(
             @JsonProperty("vehicle_route_type") String vehicleRouteType,
-            @JsonProperty("predicted_delay_seconds") double predictedDelaySeconds,
-            @JsonProperty("actual_delay_seconds") double actualDelaySeconds,
-            @JsonProperty("error_seconds") double errorSeconds,
-            @JsonProperty("predicted_at") String predictedAt
+            @JsonProperty("graded_count") int gradedCount,
+            @JsonProperty("mean_absolute_error_seconds") double meanAbsoluteErrorSeconds,
+            @JsonProperty("within_60s_share") double within60sShare,
+            @JsonProperty("persistence_mae_seconds") double persistenceMaeSeconds
     ) {
     }
 
     /**
      * Live "how good are we actually doing" stats - see PredictionScoreboard.
-     * A thin proxy, same as everything else here: the sidecar does the
-     * actual reconciliation join, this just reshapes its response into
-     * this codebase's camelCase convention.
+     * A thin proxy, same as everything else here: the sidecar computes the
+     * numbers, this just reshapes its response into this codebase's
+     * camelCase convention.
      */
     public PredictionScoreboard scoreboard() {
         UpstreamScoreboardResponse response = restClient.get()
@@ -139,12 +142,14 @@ public class DelayPredictionClient {
                 .retrieve()
                 .body(UpstreamScoreboardResponse.class);
 
-        List<PredictionScoreboard.Entry> best = response.best().stream()
-                .map(e -> new PredictionScoreboard.Entry(
-                        e.routeId(), e.vehicleRouteType(), e.predictedDelaySeconds(),
-                        e.actualDelaySeconds(), e.errorSeconds(), e.predictedAt()))
+        List<PredictionScoreboard.Group> groups = response.byVehicleType().stream()
+                .map(g -> new PredictionScoreboard.Group(
+                        g.vehicleRouteType(), g.gradedCount(), g.meanAbsoluteErrorSeconds(),
+                        g.within60sShare(), g.persistenceMaeSeconds()))
                 .toList();
-        return new PredictionScoreboard(response.reconciledCount(), response.meanAbsoluteErrorSeconds(), best);
+        return new PredictionScoreboard(response.modelVersion(), response.since(), response.gradedCount(),
+                response.meanAbsoluteErrorSeconds(), response.within60sShare(), response.persistenceMaeSeconds(),
+                groups);
     }
 
     private record UpstreamCurrentDelaysRequest(
