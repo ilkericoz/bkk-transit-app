@@ -422,13 +422,16 @@ SEGMENT_RECENT_MINUTES = 15
 SEGMENT_LOOKBACK_MARGIN = timedelta(minutes=30)
 NO_SEGMENT_RECENT = {"has_segment_recent": 0, "segment_recent_gain_seconds": 0.0, "segment_recent_count": 0}
 
+# "until" = the reference moment: later visits can't count anyway, and
+# without it a lookup for a past moment scans everything since then (~30 s
+# per lookup in the 2026-09-26 consistency check).
 SEGMENT_VISITS_QUERY = """
     SELECT stop_id, trip_id, stop_sequence, service_date,
            CASE WHEN stop_sequence = 1 THEN MAX(recorded_at) ELSE MIN(recorded_at) END AS arrived
     FROM vehicle_position_snapshots
-    WHERE recorded_at >= %(since)s
+    WHERE recorded_at >= %(since)s AND recorded_at < %(until)s
       AND status = 'STOPPED_AT' AND stop_distance_percent = 100
-      AND stop_id = ANY(%(stops)s)
+      AND stop_id = ANY(%(stops)s) AND trip_id IS NOT NULL
     GROUP BY stop_id, trip_id, stop_sequence, service_date
 """
 
@@ -496,7 +499,7 @@ def fetch_segment_recent(gtfs_trip_id: str, stop_sequence: int, stop_id: str, re
         return dict(NO_SEGMENT_RECENT)
     since = reference_time - timedelta(minutes=SEGMENT_RECENT_MINUTES) - SEGMENT_LOOKBACK_MARGIN
     with psycopg2.connect(**DB_CONFIG) as conn, conn.cursor() as cur:
-        cur.execute(SEGMENT_VISITS_QUERY, {"since": since, "stops": [prev_stop, stop_id]})
+        cur.execute(SEGMENT_VISITS_QUERY, {"since": since, "until": reference_time, "stops": [prev_stop, stop_id]})
         by_stop, by_visit = index_stop_visits(cur.fetchall())
     return pick_segment_recent(by_stop, by_visit, prev_stop, stop_id, reference_time)
 
@@ -1262,6 +1265,7 @@ def stop_predictions_once() -> dict:
             cur.execute(SEGMENT_VISITS_QUERY, {
                 "since": min(t["reference_time"] for t in targets)
                          - timedelta(minutes=SEGMENT_RECENT_MINUTES) - SEGMENT_LOOKBACK_MARGIN,
+                "until": max(t["reference_time"] for t in targets),
                 "stops": segment_stops,
             })
             visits_by_stop, visits_by_key = index_stop_visits(cur.fetchall())
