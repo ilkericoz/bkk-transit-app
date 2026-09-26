@@ -157,6 +157,9 @@ STOP_PREDICTIONS_DDL = """
         actual_delay_seconds DOUBLE PRECISION,
         UNIQUE (trip_id, service_date, stop_sequence)
     );
+    -- Added 2026-09-25 with the recent-traffic feature (nullable, additive).
+    ALTER TABLE stop_predictions ADD COLUMN IF NOT EXISTS has_segment_recent INTEGER;
+    ALTER TABLE stop_predictions ADD COLUMN IF NOT EXISTS segment_recent_gain_seconds DOUBLE PRECISION;
     CREATE INDEX IF NOT EXISTS idx_stop_predictions_ungraded
         ON stop_predictions (reference_time) WHERE actual_recorded_at IS NULL;
 """
@@ -230,6 +233,10 @@ class DelayPredictionRequest(BaseModel):
     ahead_delay_seconds: float = 0.0
     minutes_since_ahead: float = 0.0
     scheduled_gap_minutes: float = 0.0
+    # Optional recent-traffic features (see fetch_segment_recent); unset = none.
+    has_segment_recent: bool = False
+    segment_recent_gain_seconds: float = 0.0
+    segment_recent_count: int = 0
 
 
 class UpstreamDelayReading(BaseModel):
@@ -404,6 +411,94 @@ def pick_vehicle_ahead(candidates, own_trip_id: str, own_scheduled_arrival: date
         return {"has_vehicle_ahead": 1, "ahead_delay_seconds": delay, "minutes_since_ahead": minutes_since,
                 "scheduled_gap_minutes": (own_scheduled_arrival - scheduled).total_seconds() / 60}
     return dict(NO_VEHICLE_AHEAD)
+
+
+# Recent traffic on the stretch into the target stop (added 2026-09-25) -
+# live equivalent of build_delay_dataset.add_segment_recent; the constants
+# must match it.
+SEGMENT_RECENT_MINUTES = 15
+# Extra look-back so a visit that began before the window still gets its true
+# first sighting (the previous stop can be well before the target stop).
+SEGMENT_LOOKBACK_MARGIN = timedelta(minutes=30)
+NO_SEGMENT_RECENT = {"has_segment_recent": 0, "segment_recent_gain_seconds": 0.0, "segment_recent_count": 0}
+
+SEGMENT_VISITS_QUERY = """
+    SELECT stop_id, trip_id, stop_sequence, service_date,
+           CASE WHEN stop_sequence = 1 THEN MAX(recorded_at) ELSE MIN(recorded_at) END AS arrived
+    FROM vehicle_position_snapshots
+    WHERE recorded_at >= %(since)s
+      AND status = 'STOPPED_AT' AND stop_distance_percent = 100
+      AND stop_id = ANY(%(stops)s)
+    GROUP BY stop_id, trip_id, stop_sequence, service_date
+"""
+
+
+def index_stop_visits(rows) -> tuple[dict, dict]:
+    """Visits from SEGMENT_VISITS_QUERY, indexed two ways: by stop (for the
+    target stop) and by (trip, service_date, stop_sequence) (to find the same
+    vehicle's visit to the stop before)."""
+    by_stop: dict[str, list] = {}
+    by_visit: dict[tuple, tuple] = {}
+    for stop_id, trip_id, seq, service_date, arrived in rows:
+        by_stop.setdefault(stop_id, []).append((trip_id, seq, service_date, arrived))
+        by_visit[(trip_id, service_date, seq)] = (stop_id, arrived)
+    return by_stop, by_visit
+
+
+def pick_segment_recent(by_stop: dict, by_visit: dict, prev_stop_id: str | None, stop_id: str,
+                        reference_time: datetime) -> dict:
+    """
+    Mean delay gain of vehicles (any route) on prev_stop_id -> stop_id that
+    reached stop_id in the SEGMENT_RECENT_MINUTES before reference_time, each
+    measured as its own delay here minus its delay at its previous stop
+    (stop_sequence - 1, which must be prev_stop_id). Same selection as the
+    training data: both visits on the timetable, both |delay| within the
+    training data's outlier limit. Shared by the per-click lookup and the
+    every-stop job so they can't drift apart.
+    """
+    if prev_stop_id is None:
+        return dict(NO_SEGMENT_RECENT)
+    window_start = reference_time - timedelta(minutes=SEGMENT_RECENT_MINUTES)
+    gains = []
+    for trip_id, seq, service_date, arrived in by_stop.get(stop_id, []):
+        arrived = arrived.astimezone(BUDAPEST_TZ)
+        if not (window_start <= arrived < reference_time):
+            continue
+        previous = by_visit.get((trip_id, service_date, seq - 1))
+        if previous is None or previous[0] != prev_stop_id:
+            continue  # only a consecutive pair on this exact stretch counts
+        gtfs_trip_id = trip_id.removeprefix("BKK_")
+        scheduled_here = schedule_lookup.scheduled_arrival(gtfs_trip_id, seq, service_date)
+        scheduled_before = schedule_lookup.scheduled_arrival(gtfs_trip_id, seq - 1, service_date)
+        if scheduled_here is None or scheduled_before is None:
+            continue
+        delay_here = (arrived - scheduled_here).total_seconds()
+        delay_before = (previous[1].astimezone(BUDAPEST_TZ) - scheduled_before).total_seconds()
+        if abs(delay_here) > VEHICLE_AHEAD_MAX_ABS_DELAY_SECONDS or abs(delay_before) > VEHICLE_AHEAD_MAX_ABS_DELAY_SECONDS:
+            continue
+        gains.append(delay_here - delay_before)
+    if not gains:
+        return dict(NO_SEGMENT_RECENT)
+    return {"has_segment_recent": 1, "segment_recent_gain_seconds": sum(gains) / len(gains),
+            "segment_recent_count": len(gains)}
+
+
+def scheduled_prev_stop_id(gtfs_trip_id: str, stop_sequence: int) -> str | None:
+    """The live-feed form ("BKK_" + stop_id) of the trip's scheduled previous stop."""
+    previous = schedule_lookup.stop_id_at(gtfs_trip_id, stop_sequence - 1)
+    return f"BKK_{previous}" if previous else None
+
+
+def fetch_segment_recent(gtfs_trip_id: str, stop_sequence: int, stop_id: str, reference_time: datetime) -> dict:
+    """Per-click version: one query for the two stops of this stretch."""
+    prev_stop = scheduled_prev_stop_id(gtfs_trip_id, stop_sequence)
+    if prev_stop is None:
+        return dict(NO_SEGMENT_RECENT)
+    since = reference_time - timedelta(minutes=SEGMENT_RECENT_MINUTES) - SEGMENT_LOOKBACK_MARGIN
+    with psycopg2.connect(**DB_CONFIG) as conn, conn.cursor() as cur:
+        cur.execute(SEGMENT_VISITS_QUERY, {"since": since, "stops": [prev_stop, stop_id]})
+        by_stop, by_visit = index_stop_visits(cur.fetchall())
+    return pick_segment_recent(by_stop, by_visit, prev_stop, stop_id, reference_time)
 
 
 def fetch_bkk_prediction(trip_id: str, stop_sequence: int, service_date: str) -> tuple[float, int] | None:
@@ -876,6 +971,9 @@ def predict(request: DelayPredictionRequest) -> DelayPredictionResponse:
         ahead_delay_seconds=request.ahead_delay_seconds,
         minutes_since_ahead=request.minutes_since_ahead,
         scheduled_gap_minutes=request.scheduled_gap_minutes,
+        has_segment_recent=int(request.has_segment_recent),
+        segment_recent_gain_seconds=request.segment_recent_gain_seconds,
+        segment_recent_count=request.segment_recent_count,
     )
     last_confirmed_delay = (
         UpstreamDelayReading(delay_seconds=request.upstream_delay_seconds)
@@ -936,6 +1034,10 @@ def run_prediction(request: LiveVehiclePredictionRequest, source: str) -> DelayP
         fetch_vehicle_ahead(request.route_id, request.stop_id, gtfs_trip_id, scheduled_arrival, upstream.recorded_at)
         if upstream is not None else dict(NO_VEHICLE_AHEAD)
     )
+    segment = (
+        fetch_segment_recent(gtfs_trip_id, request.stop_sequence, request.stop_id, upstream.recorded_at)
+        if upstream is not None else dict(NO_SEGMENT_RECENT)
+    )
     weather = live_weather.current()
 
     predicted_delay = model.predict_one(
@@ -952,6 +1054,7 @@ def run_prediction(request: LiveVehiclePredictionRequest, source: str) -> DelayP
         wind_speed_10m=weather["wind_speed_10m"],
         deviated=int(request.deviated),
         **ahead,
+        **segment,
     )
     bkk_prediction = fetch_bkk_prediction(request.trip_id, request.stop_sequence, request.service_date)
     log_prediction(
@@ -1151,12 +1254,26 @@ def stop_predictions_once() -> dict:
             for visits in by_stop.values():
                 visits.sort(key=lambda v: v[3], reverse=True)  # newest first, like fetch_vehicle_ahead
 
+            # Recent traffic on each target's stretch: one query for all
+            # previous/target stops of this cycle, then the shared selection.
+            for t in targets:
+                t["prev_stop_id"] = scheduled_prev_stop_id(t["trip_id"].removeprefix("BKK_"), t["stop_sequence"])
+            segment_stops = sorted({t["stop_id"] for t in targets} | {t["prev_stop_id"] for t in targets if t["prev_stop_id"]})
+            cur.execute(SEGMENT_VISITS_QUERY, {
+                "since": min(t["reference_time"] for t in targets)
+                         - timedelta(minutes=SEGMENT_RECENT_MINUTES) - SEGMENT_LOOKBACK_MARGIN,
+                "stops": segment_stops,
+            })
+            visits_by_stop, visits_by_key = index_stop_visits(cur.fetchall())
+
             weather = live_weather.current()
             rows = []
             for t in targets:
                 ahead = pick_vehicle_ahead(by_stop.get((t["route_id"], t["stop_id"]), []), t["trip_id"],
                                            t["scheduled_arrival"], t["reference_time"])
-                rows.append({**t, **ahead, "has_upstream_delay": 1,
+                segment = pick_segment_recent(visits_by_stop, visits_by_key, t["prev_stop_id"], t["stop_id"],
+                                              t["reference_time"])
+                rows.append({**t, **ahead, **segment, "has_upstream_delay": 1,
                              "hour": t["scheduled_arrival"].hour, "day_of_week": t["scheduled_arrival"].weekday(),
                              "temperature_2m": weather["temperature_2m"], "precipitation": weather["precipitation"],
                              "wind_speed_10m": weather["wind_speed_10m"]})
@@ -1164,11 +1281,13 @@ def stop_predictions_once() -> dict:
             execute_values(cur, """
                 INSERT INTO stop_predictions (trip_id, route_id, vehicle_route_type, stop_id, stop_sequence,
                     service_date, reference_time, predicted_delay_seconds, upstream_delay_seconds,
-                    has_vehicle_ahead, ahead_delay_seconds, model_version)
+                    has_vehicle_ahead, ahead_delay_seconds, model_version,
+                    has_segment_recent, segment_recent_gain_seconds)
                 VALUES %s ON CONFLICT (trip_id, service_date, stop_sequence) DO NOTHING
             """, [(r["trip_id"], r["route_id"], r["vehicle_route_type"], r["stop_id"], r["stop_sequence"],
                    r["service_date"], r["reference_time"], float(p), r["upstream_delay_seconds"],
-                   r["has_vehicle_ahead"], r["ahead_delay_seconds"], model_version)
+                   r["has_vehicle_ahead"], r["ahead_delay_seconds"], model_version,
+                   r["has_segment_recent"], r["segment_recent_gain_seconds"])
                   for r, p in zip(rows, predicted)])
             conn.commit()
             predicted_count = len(rows)
