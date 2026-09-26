@@ -43,6 +43,7 @@ knowledge" convention:
 """
 
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 
 import numpy as np
@@ -73,21 +74,22 @@ def load_features() -> pd.DataFrame:
     return df
 
 
-def walk_forward_folds(df: pd.DataFrame) -> list[tuple[object, pd.DataFrame, pd.DataFrame]]:
+def walk_forward_folds(df: pd.DataFrame) -> Iterator[tuple[object, pd.DataFrame, pd.DataFrame]]:
     """Expanding-window folds: for each calendar day (after the first),
     train on every earlier day and validate on that day. Skips days too
     small to be a meaningful validation target (see MIN_VAL_ROWS), but
-    still folds them into training once a later day needs them."""
+    still folds them into training once a later day needs them.
+
+    A generator, so only one fold's copies exist at a time - building every
+    fold up front ran out of memory at 11M rows (2026-09-26)."""
     dates = sorted(df["date"].unique())
-    folds = []
     for i in range(1, len(dates)):
         val_date = dates[i]
         val = df[df["date"] == val_date]
         if len(val) < MIN_VAL_ROWS:
             continue
         train = df[df["date"].isin(dates[:i])]
-        folds.append((val_date, train, val))
-    return folds
+        yield val_date, train, val
 
 
 def evaluate_fold(train: pd.DataFrame, val: pd.DataFrame) -> dict:
@@ -127,13 +129,11 @@ def pick_winner(fold_results: list[dict]) -> tuple[str, dict[str, float]]:
 
 def main() -> None:
     df = load_features()
-    folds = walk_forward_folds(df)
-    if not folds:
+    fold_results = [evaluate_fold(train, val) for _, train, val in walk_forward_folds(df)]
+    if not fold_results:
         print("Not enough distinct days with >= MIN_VAL_ROWS yet to form a single walk-forward fold.")
         print("Re-run once at least two days meet that threshold.")
         return
-
-    fold_results = [evaluate_fold(train, val) for _, train, val in folds]
     print_fold_table(fold_results)
 
     print("\nMean MAE across folds - lower is better, and lower std/gap means the comparison is more trustworthy:")
