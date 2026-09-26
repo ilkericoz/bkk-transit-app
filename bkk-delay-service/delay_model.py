@@ -79,6 +79,13 @@ NUMERIC_FEATURES = [
     # main.py's fetch_vehicle_ahead (live), which must stay identical.
     # Controlled test: -0.65 s MAE [-0.72, -0.58], better on 20/20 days.
     "has_vehicle_ahead", "ahead_delay_seconds", "minutes_since_ahead", "scheduled_gap_minutes",
+    # Recent traffic on the stretch into this stop (added 2026-09-26): mean
+    # delay gain of any-route vehicles on (scheduled previous stop -> this
+    # stop) in the 15 min before the upstream stop was confirmed - see
+    # build_delay_dataset.add_segment_recent (training) and main.py's
+    # pick_segment_recent (live); consistency check 400/400.
+    # Controlled test: -0.66 s MAE [-0.70, -0.61].
+    "has_segment_recent", "segment_recent_gain_seconds", "segment_recent_count",
 ]
 ALL_FEATURES = CATEGORICAL_FEATURES + NUMERIC_FEATURES
 TARGET = "delay_seconds"
@@ -199,6 +206,9 @@ class GbtDelayModel(BaseDelayModel):
             "ahead_delay_seconds": df["ahead_delay_seconds"],
             "minutes_since_ahead": df["minutes_since_ahead"],
             "scheduled_gap_minutes": df["scheduled_gap_minutes"],
+            "has_segment_recent": df["has_segment_recent"],
+            "segment_recent_gain_seconds": df["segment_recent_gain_seconds"],
+            "segment_recent_count": df["segment_recent_count"],
             "route_id_mean_delay": df["route_id"].map(self.route_mean_delay).fillna(self.global_mean_delay),
             "stop_id_mean_delay": df["stop_id"].map(self.stop_mean_delay).fillna(self.global_mean_delay),
         })
