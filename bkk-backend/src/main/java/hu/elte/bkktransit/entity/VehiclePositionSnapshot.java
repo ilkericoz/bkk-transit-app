@@ -16,9 +16,12 @@ import java.time.Instant;
  * time the vehicle is polled, so we need a generated surrogate id. This is
  * the table stage 5 (delay-prediction) will eventually train on.
  */
+// idx_snapshot_vehicle_id (vehicleId) was removed 2026-09-26: 1.2 GB,
+// 30 scans ever, no query looks rows up by vehicle. Don't re-add it here -
+// with ddl-auto=update Hibernate would rebuild it on startup WITHOUT
+// CONCURRENTLY, locking writes to this table while it builds.
 @Entity
 @Table(name = "vehicle_position_snapshots", indexes = {
-        @Index(name = "idx_snapshot_vehicle_id", columnList = "vehicleId"),
         @Index(name = "idx_snapshot_recorded_at", columnList = "recordedAt"),
         @Index(name = "idx_snapshot_trip_id", columnList = "tripId")
 })
