@@ -22,7 +22,7 @@ differs). So:
     understates day-to-day variation, which with few days per model is the
     bigger uncertainty - hence the warning below 2 days per model;
   - predictions touching a known collector backlog are dropped (see
-    COLLECTOR_BACKLOGS).
+    data_quality.COLLECTOR_BACKLOGS).
 
 Read-only. Usage (from bkk-delay-service/, host venv):
     python scripts/live_model_comparison.py --old 378f437fd810 --new 7f90a3bdd515
@@ -31,10 +31,15 @@ Read-only. Usage (from bkk-delay-service/, host venv):
 
 import argparse
 import os
+import sys
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import psycopg2
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from data_quality import COLLECTOR_BACKLOGS
 
 DB_CONFIG = {
     "host": os.environ.get("DB_HOST", "localhost"),
@@ -47,17 +52,6 @@ DB_CONFIG = {
 # Same outlier limit as the training labels (build_delay_dataset's
 # MAX_ABS_DELAY_SECONDS) and the 5p analysis.
 MAX_ABS_DELAY_SECONDS = 3600
-
-# Periods when the backend's RabbitMQ consumer fell behind. recorded_at is
-# set when the consumer saves a row (VehiclePositionConsumer: Instant.now()),
-# not when BKK reported the position, so during a backlog every arrival is
-# recorded late - by up to ~19 min on 26 Sep (median lag vs BKK's
-# last_update_time: normally ~11 s). Predictions whose reference moment or
-# graded arrival falls inside are dropped. Found from the lag itself, see
-# DEVLOG 2026-09-26.
-COLLECTOR_BACKLOGS = [
-    ("2026-09-26 16:26:00+02:00", "2026-09-26 16:58:00+02:00"),
-]
 
 # Bootstrap block length (see the module docstring).
 BLOCK_MINUTES = 10

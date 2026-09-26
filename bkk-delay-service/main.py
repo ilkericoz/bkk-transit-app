@@ -38,6 +38,7 @@ import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from data_quality import backlog_sql_filter
 from delay_model import BaseDelayModel
 from gtfs_schedule import ScheduleLookup
 from weather import LiveWeather
@@ -565,7 +566,7 @@ def log_prediction(
         conn.commit()
 
 
-class ScoreboardEntry(BaseModel):
+class SampledScoreboardEntry(BaseModel):
     route_id: str | None
     vehicle_route_type: str | None
     predicted_delay_seconds: float
@@ -574,10 +575,10 @@ class ScoreboardEntry(BaseModel):
     predicted_at: datetime
 
 
-class Scoreboard(BaseModel):
+class SampledScoreboard(BaseModel):
     reconciled_count: int
     mean_absolute_error_seconds: float | None
-    best: list[ScoreboardEntry]
+    best: list[SampledScoreboardEntry]
 
 
 # The headline MAE is averaged over every reconciled prediction, not a
@@ -599,9 +600,16 @@ FIRST_STOP_DEPARTURE_SINCE = "2026-09-23 13:56:30+02:00"
 MAX_ABS_RECONCILED_DELAY_SECONDS = 1500  # see the skip below - deliberately tighter than build_delay_dataset.py's 3600s
 
 
-@app.get("/scoreboard", response_model=Scoreboard)
-def scoreboard() -> Scoreboard:
+@app.get("/scoreboard/sampled", response_model=SampledScoreboard)
+def sampled_scoreboard() -> SampledScoreboard:
     """
+    The map's scoreboard until 2026-09-26 (was /scoreboard), kept for the
+    thesis: it scores the SAMPLED predictions (clicks + auto-sampler), a
+    harder population than the every-stop predictions /scoreboard now uses
+    (cold starts, longer look-aheads, length-biased sampling - see the
+    README's 2026-09-26 entries). All models since the start, not just the
+    current one. Slow (~4 s: joins the snapshots table).
+
     Reconciles logged predictions against what actually happened, computed
     on read rather than via a background job - prediction_log's volume
     (a few hundred click rows plus a bounded 50-per-5-minutes auto-sampling
@@ -743,7 +751,7 @@ def scoreboard() -> Scoreboard:
             continue
         entries.append((
             (trip_id, stop_sequence, service_date),
-            ScoreboardEntry(
+            SampledScoreboardEntry(
                 route_id=route_id,
                 vehicle_route_type=vehicle_route_type,
                 predicted_delay_seconds=predicted_delay_seconds,
@@ -773,11 +781,95 @@ def scoreboard() -> Scoreboard:
         sum(e.error_seconds for e in entries) / len(entries) if entries else None
     )
     best = sorted(entries, key=lambda e: e.error_seconds)[:SCOREBOARD_BEST_DISPLAY]
-    return Scoreboard(
+    return SampledScoreboard(
         reconciled_count=len(entries),
         mean_absolute_error_seconds=mean_absolute_error,
         best=best,
     )
+
+
+class ScoreboardGroup(BaseModel):
+    vehicle_route_type: str
+    graded_count: int
+    mean_absolute_error_seconds: float
+    within_60s_share: float
+    persistence_mae_seconds: float
+
+
+class Scoreboard(BaseModel):
+    model_version: str | None
+    since: datetime | None
+    graded_count: int
+    mean_absolute_error_seconds: float | None
+    within_60s_share: float | None
+    # Carrying the delay at the previous stop forward unchanged, scored on
+    # the same predictions - the "no model" yardstick for the number above.
+    persistence_mae_seconds: float | None
+    by_vehicle_type: list[ScoreboardGroup]
+
+
+# The query scans the current model's rows of stop_predictions (~250k new
+# rows a day, ~0.2 s at 380k rows); the map polls every 30 s per open page,
+# so the result is shared for this long.
+SCOREBOARD_CACHE_SECONDS = 60
+_scoreboard_cache: tuple[float, Scoreboard] | None = None
+
+SCOREBOARD_QUERY = f"""
+    SELECT GROUPING(vehicle_route_type) = 1 AS is_total, coalesce(vehicle_route_type, 'UNKNOWN'), count(*),
+           avg(abs(predicted_delay_seconds - actual_delay_seconds)),
+           avg((abs(predicted_delay_seconds - actual_delay_seconds) <= 60)::int)::float8,
+           avg(abs(upstream_delay_seconds - actual_delay_seconds)),
+           min(predicted_at)
+    FROM stop_predictions
+    WHERE model_version = %(model_version)s AND actual_delay_seconds IS NOT NULL
+      AND abs(actual_delay_seconds) <= %(max_abs_delay)s
+      AND {backlog_sql_filter(["reference_time", "actual_recorded_at"])}
+    GROUP BY ROLLUP (vehicle_route_type)
+"""
+
+
+@app.get("/scoreboard", response_model=Scoreboard)
+def scoreboard() -> Scoreboard:
+    """
+    Live accuracy of the CURRENT model, from the every-stop job
+    (stop_predictions): every vehicle's next stop, predicted when its
+    previous stop is confirmed and graded on arrival - the same population
+    as the offline walk-forward test, so the two numbers are comparable
+    (README 2026-09-26: 27.5 s live vs 28.4 s offline). Replaced the
+    sampled-predictions scoreboard (now /scoreboard/sampled) on 2026-09-26:
+    that one mixed every model since the start and a harder, length-biased
+    sample, so it showed ~52 s for a model that is ~27 s on this measure.
+
+    Same outlier limit as the training labels (|actual| <= 3600 s) and
+    without known collector backlogs (data_quality.COLLECTOR_BACKLOGS),
+    where arrivals were recorded up to ~19 min late.
+    """
+    global _scoreboard_cache
+    if _scoreboard_cache and time.time() - _scoreboard_cache[0] < SCOREBOARD_CACHE_SECONDS \
+            and _scoreboard_cache[1].model_version == model_version:
+        return _scoreboard_cache[1]
+
+    with psycopg2.connect(**DB_CONFIG) as conn, conn.cursor() as cur:
+        cur.execute(SCOREBOARD_QUERY, {"model_version": model_version,
+                                       "max_abs_delay": VEHICLE_AHEAD_MAX_ABS_DELAY_SECONDS})
+        rows = cur.fetchall()
+
+    # ROLLUP adds the all-types row (is_total) - absent when nothing is graded yet.
+    total = next((r[1:] for r in rows if r[0]), None)
+    groups = [ScoreboardGroup(vehicle_route_type=vtype, graded_count=n, mean_absolute_error_seconds=mae,
+                              within_60s_share=within, persistence_mae_seconds=persist)
+              for is_total, vtype, n, mae, within, persist, _since in rows if not is_total]
+    result = Scoreboard(
+        model_version=model_version,
+        since=total[5] if total else None,
+        graded_count=total[1] if total else 0,
+        mean_absolute_error_seconds=total[2] if total else None,
+        within_60s_share=total[3] if total else None,
+        persistence_mae_seconds=total[4] if total else None,
+        by_vehicle_type=sorted(groups, key=lambda g: g.graded_count, reverse=True),
+    )
+    _scoreboard_cache = (time.time(), result)
+    return result
 
 
 @app.get("/health")
