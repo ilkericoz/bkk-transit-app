@@ -187,12 +187,14 @@ async def lifespan(app: FastAPI):
         cur.execute(PREDICTION_LOG_DDL)
         cur.execute(SCOREBOARD_INDEX_DDL)
         cur.execute(STOP_PREDICTIONS_DDL)
+        cur.execute(BKK_STOP_SAMPLES_DDL)
         conn.commit()
 
     sampler = asyncio.create_task(auto_sample_loop()) if AUTO_SAMPLE_ENABLED else None
     stop_predictor = asyncio.create_task(stop_predictions_loop()) if STOP_PREDICTIONS_ENABLED else None
+    bkk_stop_sampler = asyncio.create_task(bkk_stop_sample_loop()) if BKK_STOP_SAMPLE_ENABLED else None
     yield
-    for task in (sampler, stop_predictor):
+    for task in (sampler, stop_predictor, bkk_stop_sampler):
         if task is not None:
             task.cancel()
 
@@ -1462,3 +1464,124 @@ async def stop_predictions_loop() -> None:
         except Exception as exc:  # noqa: BLE001 - keep the loop alive across DB hiccups
             logger.warning("stop-predictions: cycle failed (%s: %s)", type(exc).__name__, exc)
         await asyncio.sleep(max(1.0, STOP_PREDICTIONS_INTERVAL_SECONDS - (time.time() - started)))
+
+
+# BKK's own prediction for a random slice of the every-stop targets (added
+# 2026-09-27): the fair head-to-head - the same stop visits as
+# stop_predictions, with BKK asked within seconds of our prediction moment.
+# Deliberately separate from stop_predictions_once: that job only processes
+# an event once it is STOP_PREDICTIONS_SETTLE (60 s) old, so asking BKK from
+# there would give BKK 60-90 s of extra knowledge about a stop typically
+# ~1.5 min away. An arrival (stop_sequence > 1) is final at its first
+# sighting, so it can be sampled at once; first-stop departures, which need
+# the settle, are left out. Sampling stop VISITS at a fixed rate (not
+# vehicles at random moments, like auto_sample_loop) avoids that sampler's
+# length bias. A row joins stop_predictions on (trip_id, service_date,
+# stop_sequence) - the same UNIQUE key - and its reference_time must match.
+BKK_STOP_SAMPLE_FRACTION = float(os.environ.get("BKK_STOP_SAMPLE_FRACTION", "0.03"))
+BKK_STOP_SAMPLE_ENABLED = STOP_PREDICTIONS_ENABLED and bool(BKK_API_KEY) and BKK_STOP_SAMPLE_FRACTION > 0
+BKK_STOP_SAMPLE_INTERVAL_SECONDS = 10
+# Hard cap on BKK calls per cycle (~48 a minute at most; ~30 at rush hour at
+# 3%) - on top of auto_sample_loop's ~10 a minute. BKK's rate limits are
+# unknown, and a blocked key would stop the whole collector.
+BKK_STOP_SAMPLE_MAX_PER_CYCLE = 8
+# A visit's first sighting must lie inside this window to count as an arrival.
+BKK_STOP_SAMPLE_LOOKBACK = timedelta(minutes=10)
+BKK_STOP_SAMPLE_LOG_EVERY = 30  # cycles (~5 min) per summary log line
+
+_bkk_stop_sample_watermark: datetime | None = None
+
+BKK_STOP_SAMPLES_DDL = """
+    CREATE TABLE IF NOT EXISTS bkk_stop_samples (
+        id BIGSERIAL PRIMARY KEY,
+        trip_id VARCHAR(255) NOT NULL,
+        service_date VARCHAR(255) NOT NULL,
+        -- The TARGET (next) stop, as in stop_predictions.
+        stop_sequence INTEGER NOT NULL,
+        -- First sighting at the previous stop = our prediction moment.
+        reference_time TIMESTAMPTZ NOT NULL,
+        -- Taken just before BKK was asked.
+        fetched_at TIMESTAMPTZ NOT NULL,
+        -- NULL = BKK had no prediction for that stop.
+        bkk_predicted_delay_seconds DOUBLE PRECISION,
+        bkk_predicted_arrival_epoch BIGINT,
+        UNIQUE (trip_id, service_date, stop_sequence)
+    );
+"""
+
+FRESH_ARRIVALS_QUERY = """
+    SELECT trip_id, stop_sequence, service_date, MIN(recorded_at) AS arrived
+    FROM vehicle_position_snapshots
+    WHERE recorded_at > %(window_start)s
+      AND status = 'STOPPED_AT' AND stop_distance_percent = 100
+      AND trip_id IS NOT NULL AND stop_sequence > 1
+    GROUP BY trip_id, stop_sequence, service_date
+    HAVING MIN(recorded_at) > %(prev)s AND MIN(recorded_at) <= %(until)s
+"""
+
+
+def bkk_stop_sample_once() -> dict:
+    """One cycle: find arrivals first seen since the last cycle, pick
+    BKK_STOP_SAMPLE_FRACTION of those stop_predictions_once will also
+    predict, ask BKK for its prediction for each one's next stop now, store
+    the answers. Blocking (DB + HTTP), run in a worker thread."""
+    global _bkk_stop_sample_watermark
+    until = datetime.now(BUDAPEST_TZ)
+    prev = _bkk_stop_sample_watermark or until - timedelta(seconds=BKK_STOP_SAMPLE_INTERVAL_SECONDS)
+    with psycopg2.connect(**DB_CONFIG) as conn, conn.cursor() as cur:
+        cur.execute(FRESH_ARRIVALS_QUERY, {"window_start": prev - BKK_STOP_SAMPLE_LOOKBACK, "prev": prev, "until": until})
+        arrivals = cur.fetchall()
+    _bkk_stop_sample_watermark = until
+
+    # Same eligibility rules as stop_predictions_once, so every sample has a
+    # partner prediction there.
+    eligible = []
+    for trip_id, seq, service_date, arrived in arrivals:
+        gtfs_trip_id = trip_id.removeprefix("BKK_")
+        scheduled_here = schedule_lookup.scheduled_arrival(gtfs_trip_id, seq, service_date)
+        if scheduled_here is None or schedule_lookup.scheduled_arrival(gtfs_trip_id, seq + 1, service_date) is None:
+            continue
+        if abs((arrived.astimezone(BUDAPEST_TZ) - scheduled_here).total_seconds()) > VEHICLE_AHEAD_MAX_ABS_DELAY_SECONDS:
+            continue
+        eligible.append((trip_id, seq, service_date, arrived))
+    picked = [e for e in eligible if random.random() < BKK_STOP_SAMPLE_FRACTION]
+    random.shuffle(picked)
+    picked = picked[:BKK_STOP_SAMPLE_MAX_PER_CYCLE]
+
+    rows = []
+    for trip_id, seq, service_date, arrived in picked:
+        fetched_at = datetime.now(BUDAPEST_TZ)
+        bkk = fetch_bkk_prediction(trip_id, seq + 1, service_date)
+        rows.append((trip_id, service_date, seq + 1, arrived, fetched_at,
+                     bkk[0] if bkk else None, bkk[1] if bkk else None))
+    if rows:
+        with psycopg2.connect(**DB_CONFIG) as conn, conn.cursor() as cur:
+            execute_values(cur, """
+                INSERT INTO bkk_stop_samples (trip_id, service_date, stop_sequence, reference_time, fetched_at,
+                    bkk_predicted_delay_seconds, bkk_predicted_arrival_epoch)
+                VALUES %s ON CONFLICT (trip_id, service_date, stop_sequence) DO NOTHING
+            """, rows)
+            conn.commit()
+    return {"arrivals": len(arrivals), "eligible": len(eligible), "sampled": len(rows),
+            "bkk_answered": sum(r[5] is not None for r in rows)}
+
+
+async def bkk_stop_sample_loop() -> None:
+    logger.info("bkk-stop-sample: enabled, %.0f%% of arrivals, every %ds",
+                100 * BKK_STOP_SAMPLE_FRACTION, BKK_STOP_SAMPLE_INTERVAL_SECONDS)
+    totals: dict[str, int] = {}
+    cycles = 0
+    while True:
+        started = time.time()
+        try:
+            for key, value in (await asyncio.to_thread(bkk_stop_sample_once)).items():
+                totals[key] = totals.get(key, 0) + value
+            cycles += 1
+            if cycles % BKK_STOP_SAMPLE_LOG_EVERY == 0:
+                logger.info("bkk-stop-sample: last %d cycles %s", BKK_STOP_SAMPLE_LOG_EVERY, totals)
+                totals = {}
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - keep the loop alive across DB hiccups
+            logger.warning("bkk-stop-sample: cycle failed (%s: %s)", type(exc).__name__, exc)
+        await asyncio.sleep(max(1.0, BKK_STOP_SAMPLE_INTERVAL_SECONDS - (time.time() - started)))
