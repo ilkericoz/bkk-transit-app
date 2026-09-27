@@ -32,6 +32,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import joblib
 import psycopg2
 from psycopg2.extras import execute_values
 import requests
@@ -172,11 +173,16 @@ model_version: str | None = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global model, schedule_lookup, model_version
+    global model, schedule_lookup, model_version, long_range, long_range_version
     if not MODEL_PATH.exists():
         raise RuntimeError(f"No trained model at {MODEL_PATH} - run scripts/train_model.py first.")
     model = BaseDelayModel.load(MODEL_PATH)
     model_version = hashlib.sha256(MODEL_PATH.read_bytes()).hexdigest()[:12]
+    if STOP_PREDICTIONS_ENABLED and LONG_RANGE_FRACTION > 0 and LONG_RANGE_MODEL_PATH.exists():
+        long_range = joblib.load(LONG_RANGE_MODEL_PATH)
+        long_range_version = hashlib.sha256(LONG_RANGE_MODEL_PATH.read_bytes()).hexdigest()[:12]
+        logger.info("long-range: model %s, %.0f%% of stop events, %s stops ahead",
+                    long_range_version, 100 * LONG_RANGE_FRACTION, LONG_RANGE_STOPS_AHEAD)
     schedule_lookup = ScheduleLookup()
 
     # Self-provisioning rather than a manual migration step - this table is
@@ -188,6 +194,7 @@ async def lifespan(app: FastAPI):
         cur.execute(SCOREBOARD_INDEX_DDL)
         cur.execute(STOP_PREDICTIONS_DDL)
         cur.execute(BKK_STOP_SAMPLES_DDL)
+        cur.execute(LONG_RANGE_DDL)
         conn.commit()
 
     sampler = asyncio.create_task(auto_sample_loop()) if AUTO_SAMPLE_ENABLED else None
@@ -1325,11 +1332,17 @@ STOP_EVENTS_QUERY = """
 
 # Candidate vehicles ahead for all target stops of this cycle in one query -
 # the same visits fetch_vehicle_ahead would find one stop at a time.
+# "until" (added 2026-09-27) = the latest reference moment + CANDIDATES_MARGIN:
+# without an end, a lookup for a past moment scans everything since then.
+# Not the reference moment itself: a first stop's visit is its LAST sighting
+# (departure), and cutting there would turn a vehicle still waiting into a
+# fake earlier departure. Live, until is in the future - no change.
+CANDIDATES_MARGIN = timedelta(hours=3)
 STOP_AHEAD_CANDIDATES_QUERY = """
     SELECT route_id, stop_id, trip_id, stop_sequence, service_date,
            CASE WHEN stop_sequence = 1 THEN MAX(recorded_at) ELSE MIN(recorded_at) END AS arrived
     FROM vehicle_position_snapshots
-    WHERE recorded_at >= %(since)s
+    WHERE recorded_at >= %(since)s AND recorded_at < %(until)s
       AND status = 'STOPPED_AT' AND stop_distance_percent = 100
       AND route_id = ANY(%(routes)s) AND stop_id = ANY(%(stops)s)
     GROUP BY route_id, stop_id, trip_id, stop_sequence, service_date
@@ -1383,6 +1396,7 @@ def stop_predictions_once() -> dict:
         if targets:
             cur.execute(STOP_AHEAD_CANDIDATES_QUERY, {
                 "since": min(t["reference_time"] for t in targets) - timedelta(minutes=VEHICLE_AHEAD_MAX_MINUTES + 15),
+                "until": max(t["reference_time"] for t in targets) + CANDIDATES_MARGIN,
                 "routes": sorted({t["route_id"] for t in targets}),
                 "stops": sorted({t["stop_id"] for t in targets}),
             })
@@ -1432,7 +1446,15 @@ def stop_predictions_once() -> dict:
             predicted_count = len(rows)
 
         _stop_predictions_watermark = until
-        return {"events": len(events), "predicted": predicted_count, **grade_stop_predictions(cur, conn)}
+        long_range_count = 0
+        if long_range is not None and targets:
+            try:
+                long_range_count = predict_long_range(cur, conn, targets)
+            except Exception as exc:  # noqa: BLE001 - never let the extra predictions break the main job
+                conn.rollback()
+                logger.warning("long-range: prediction failed (%s: %s)", type(exc).__name__, exc)
+        return {"events": len(events), "predicted": predicted_count, **grade_stop_predictions(cur, conn),
+                "long_range": long_range_count, **(grade_long_range(cur, conn) if long_range is not None else {})}
 
 
 def grade_stop_predictions(cur, conn) -> dict:
@@ -1585,3 +1607,184 @@ async def bkk_stop_sample_loop() -> None:
         except Exception as exc:  # noqa: BLE001 - keep the loop alive across DB hiccups
             logger.warning("bkk-stop-sample: cycle failed (%s: %s)", type(exc).__name__, exc)
         await asyncio.sleep(max(1.0, BKK_STOP_SAMPLE_INTERVAL_SECONDS - (time.time() - started)))
+
+
+# Long-range predictions (added 2026-09-27): for a random LONG_RANGE_FRACTION
+# of the stop events the every-stop job handles, also predict the vehicle's
+# delay LONG_RANGE_STOPS_AHEAD stops ahead with the model from
+# scripts/train_long_range.py (trees on the current delay, how far ahead,
+# the typical and recent delay gain on the stretches ahead, and the vehicle
+# ahead at the target stop - 48.2 s vs 58.8 s for "keep the current delay"
+# in the thesis's 22-day walk-forward test), and grade each on arrival.
+# Its own table: stop_predictions allows one prediction per target stop,
+# which the next-stop prediction already uses, and keeping them apart
+# leaves the scoreboard untouched. Sampling stop events (not moments) keeps
+# the evaluation unbiased while adding ~200k rows a day instead of ~800k.
+LONG_RANGE_MODEL_PATH = Path(__file__).resolve().parent / "models" / "long_range_model.joblib"
+LONG_RANGE_STOPS_AHEAD = (3, 5, 10)
+LONG_RANGE_FRACTION = float(os.environ.get("LONG_RANGE_FRACTION", "0.25"))
+long_range: dict | None = None  # the saved artifact: model + lookup tables
+long_range_version: str | None = None
+
+LONG_RANGE_DDL = """
+    CREATE TABLE IF NOT EXISTS long_range_predictions (
+        id BIGSERIAL PRIMARY KEY,
+        trip_id VARCHAR(255) NOT NULL,
+        route_id VARCHAR(255),
+        vehicle_route_type VARCHAR(255),
+        service_date VARCHAR(255) NOT NULL,
+        -- The stop just confirmed (the prediction moment) and the target.
+        ref_stop_sequence INTEGER NOT NULL,
+        stop_id VARCHAR(255) NOT NULL,
+        stop_sequence INTEGER NOT NULL,
+        stops_ahead INTEGER NOT NULL,
+        scheduled_minutes_ahead DOUBLE PRECISION NOT NULL,
+        reference_time TIMESTAMPTZ NOT NULL,
+        predicted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        predicted_delay_seconds DOUBLE PRECISION NOT NULL,
+        -- Delay at the confirmed stop = the "keep the current delay" baseline.
+        upstream_delay_seconds DOUBLE PRECISION NOT NULL,
+        path_hist DOUBLE PRECISION,
+        path_recent DOUBLE PRECISION,
+        path_cov DOUBLE PRECISION,
+        has_vehicle_ahead INTEGER,
+        model_version VARCHAR(32),
+        actual_recorded_at TIMESTAMPTZ,
+        actual_delay_seconds DOUBLE PRECISION,
+        UNIQUE (trip_id, service_date, ref_stop_sequence, stop_sequence)
+    );
+    CREATE INDEX IF NOT EXISTS idx_long_range_ungraded
+        ON long_range_predictions (reference_time) WHERE actual_recorded_at IS NULL;
+"""
+
+# Target stops are never a first stop, so the arrival = first sighting after
+# the prediction moment (as STOP_GRADE_QUERY).
+LONG_RANGE_GRADE_QUERY = """
+    SELECT lr.id, lr.trip_id, lr.stop_sequence, lr.service_date, MIN(vs.recorded_at) AS arrived
+    FROM long_range_predictions lr
+    JOIN vehicle_position_snapshots vs
+      ON vs.trip_id = lr.trip_id AND vs.stop_id = lr.stop_id AND vs.stop_sequence = lr.stop_sequence
+     AND vs.service_date = lr.service_date AND vs.status = 'STOPPED_AT' AND vs.stop_distance_percent = 100
+     AND vs.recorded_at > lr.reference_time
+    WHERE lr.actual_recorded_at IS NULL AND lr.reference_time > now() - interval '3 hours'
+    GROUP BY lr.id, lr.trip_id, lr.stop_sequence, lr.service_date
+"""
+
+
+def long_range_inputs(cur, cases: list[tuple[dict, int]]) -> list[dict | None]:
+    """
+    Model inputs for each (event, stops ahead) case - the live side of
+    scripts/train_long_range.py, shared by the every-stop job and the
+    train/serve consistency check. `event` needs trip_id, route_id,
+    vehicle_route_type, service_date, ref_seq, reference_time,
+    upstream_delay_seconds. Two bulk queries for all cases (visits on the
+    stretches ahead, candidate vehicles ahead at the targets), then the same
+    selection rules as the next-stop model (pick_segment_recent,
+    pick_vehicle_ahead). None when a case is out of range (past the trip's
+    end, more than max_scheduled_minutes ahead, not on the timetable).
+    """
+    plans = []
+    for event, k in cases:
+        gtfs_trip_id = event["trip_id"].removeprefix("BKK_")
+        ref_seq, service_date = event["ref_seq"], event["service_date"]
+        scheduled_here = schedule_lookup.scheduled_arrival(gtfs_trip_id, ref_seq, service_date)
+        scheduled_target = schedule_lookup.scheduled_arrival(gtfs_trip_id, ref_seq + k, service_date)
+        stop_ids = [schedule_lookup.stop_id_at(gtfs_trip_id, ref_seq + m) for m in range(k + 1)]
+        if scheduled_here is None or scheduled_target is None or None in stop_ids:
+            plans.append(None)
+            continue
+        sched_min = (scheduled_target - scheduled_here).total_seconds() / 60
+        if not 0 < sched_min <= long_range["max_scheduled_minutes"]:
+            plans.append(None)
+            continue
+        stop_ids = [f"BKK_{sid}" for sid in stop_ids]
+        plans.append({"event": event, "k": k, "stretches": list(zip(stop_ids[:-1], stop_ids[1:])),
+                      "target_stop": stop_ids[-1], "scheduled_here": scheduled_here,
+                      "scheduled_target": scheduled_target, "sched_min": sched_min})
+    live = [plan for plan in plans if plan]
+    if not live:
+        return plans
+
+    first = min(plan["event"]["reference_time"] for plan in live)
+    last = max(plan["event"]["reference_time"] for plan in live)
+    cur.execute(SEGMENT_VISITS_QUERY, {
+        "since": first - timedelta(minutes=SEGMENT_RECENT_MINUTES) - SEGMENT_LOOKBACK_MARGIN, "until": last,
+        "stops": sorted({stop for plan in live for stretch in plan["stretches"] for stop in stretch}),
+    })
+    visits_by_stop, visits_by_key = index_stop_visits(cur.fetchall())
+    cur.execute(STOP_AHEAD_CANDIDATES_QUERY, {
+        "since": first - timedelta(minutes=VEHICLE_AHEAD_MAX_MINUTES + 15),
+        "until": last + CANDIDATES_MARGIN,
+        "routes": sorted({plan["event"]["route_id"] for plan in live}),
+        "stops": sorted({plan["target_stop"] for plan in live}),
+    })
+    candidates: dict[tuple[str, str], list] = {}
+    for route_id, stop_id, trip_id, seq, service_date, arrived in cur.fetchall():
+        candidates.setdefault((route_id, stop_id), []).append((trip_id, seq, service_date, arrived))
+    for visits in candidates.values():
+        visits.sort(key=lambda v: v[3], reverse=True)  # newest first, as pick_vehicle_ahead expects
+
+    typical, drift = long_range["typical_gain"], long_range["route_drift"]
+    for plan in live:
+        event, k, reference_time = plan["event"], plan["k"], plan["event"]["reference_time"]
+        recent = [pick_segment_recent(visits_by_stop, visits_by_key, a, b, reference_time) for a, b in plan["stretches"]]
+        ahead = pick_vehicle_ahead(candidates.get((event["route_id"], plan["target_stop"]), []), event["trip_id"],
+                                   plan["scheduled_target"], reference_time)
+        local = plan["scheduled_here"].astimezone(BUDAPEST_TZ)
+        plan["features"] = {
+            "d_a": event["upstream_delay_seconds"], "sched_min": plan["sched_min"], "k": k,
+            "hour": local.hour, "dow": local.weekday(), "stop_sequence_a": event["ref_seq"],
+            "route_drift": drift.get(event["route_id"], 0.0), "vtype": event["vehicle_route_type"],
+            "path_hist": sum(typical.get(stretch, 0.0) for stretch in plan["stretches"]),
+            "path_recent": sum(r["segment_recent_gain_seconds"] for r in recent),
+            "path_cov": sum(r["has_segment_recent"] for r in recent) / k,
+            "has_ahead": ahead["has_vehicle_ahead"], "ahead_delay": ahead["ahead_delay_seconds"],
+            "ahead_age_min": ahead["minutes_since_ahead"], "ahead_gap_min": ahead["scheduled_gap_minutes"],
+        }
+    return plans
+
+
+def long_range_predict(plans: list[dict]) -> list[float]:
+    import pandas as pd
+    x = pd.DataFrame([plan["features"] for plan in plans])[long_range["features"]]
+    x["vtype"] = x["vtype"].astype("category").cat.set_categories(long_range["vehicle_types"])
+    return [float(v) for v in long_range["model"].predict(x)]
+
+
+def predict_long_range(cur, conn, targets: list[dict]) -> int:
+    """Long-range predictions for a random slice of this cycle's stop events
+    (targets = the next-stop feature rows of stop_predictions_once)."""
+    events = [{**t, "ref_seq": t["stop_sequence"] - 1} for t in targets if random.random() < LONG_RANGE_FRACTION]
+    plans = [plan for plan in long_range_inputs(cur, [(e, k) for e in events for k in LONG_RANGE_STOPS_AHEAD]) if plan]
+    if not plans:
+        return 0
+    predictions = long_range_predict(plans)
+    execute_values(cur, """
+        INSERT INTO long_range_predictions (trip_id, route_id, vehicle_route_type, service_date, ref_stop_sequence,
+            stop_id, stop_sequence, stops_ahead, scheduled_minutes_ahead, reference_time, predicted_delay_seconds,
+            upstream_delay_seconds, path_hist, path_recent, path_cov, has_vehicle_ahead, model_version)
+        VALUES %s ON CONFLICT (trip_id, service_date, ref_stop_sequence, stop_sequence) DO NOTHING
+    """, [(p["event"]["trip_id"], p["event"]["route_id"], p["event"]["vehicle_route_type"], p["event"]["service_date"],
+           p["event"]["ref_seq"], p["target_stop"], p["event"]["ref_seq"] + p["k"], p["k"], p["sched_min"],
+           p["event"]["reference_time"], pred, p["event"]["upstream_delay_seconds"], p["features"]["path_hist"],
+           p["features"]["path_recent"], p["features"]["path_cov"], p["features"]["has_ahead"], long_range_version)
+          for p, pred in zip(plans, predictions)])
+    conn.commit()
+    return len(plans)
+
+
+def grade_long_range(cur, conn) -> dict:
+    """Fill in the actual delay for long-range predictions whose target was reached."""
+    cur.execute(LONG_RANGE_GRADE_QUERY)
+    graded = []
+    for pred_id, trip_id, seq, service_date, arrived in cur.fetchall():
+        scheduled = schedule_lookup.scheduled_arrival(trip_id.removeprefix("BKK_"), seq, service_date)
+        if scheduled is not None:
+            graded.append((pred_id, arrived, (arrived.astimezone(BUDAPEST_TZ) - scheduled).total_seconds()))
+    if graded:
+        execute_values(cur, """
+            UPDATE long_range_predictions lr SET actual_recorded_at = g.arrived, actual_delay_seconds = g.delay
+            FROM (VALUES %s) AS g(id, arrived, delay) WHERE lr.id = g.id
+        """, graded, template="(%s, %s::timestamptz, %s::double precision)")
+        conn.commit()
+    return {"long_range_graded": len(graded)}
