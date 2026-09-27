@@ -9,9 +9,11 @@ package hu.elte.bkktransit.service;
  * a long stretch between stops keeps its color longer. predictionError*
  * (added 2026-09-25, null until graded): predicted minus actual delay of
  * this trip's latest graded every-stop prediction, for the map's accuracy mode.
+ * predictionAccurate (added 2026-09-27): whether that prediction was within
+ * the MBTA arrival-prediction standard (main.py's ACCURACY_WINDOWS).
  */
 public record CurrentDelay(double delaySeconds, double minutesAgo, double staleAfterMinutes,
                            Double predictionErrorSeconds, Double predictionGradedMinutesAgo,
                            String stopId, String gradedStopId, Double gradedPredictedSeconds,
-                           Double gradedActualSeconds) {
+                           Double gradedActualSeconds, Boolean predictionAccurate) {
 }

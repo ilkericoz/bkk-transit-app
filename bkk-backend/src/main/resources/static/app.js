@@ -80,22 +80,31 @@ function delayColor(delaySeconds) {
 }
 
 // Second colouring mode (added 2026-09-25), switched in the legend: how
-// far off our latest graded prediction for this vehicle was (predicted vs
+// good our latest graded prediction for this vehicle was (predicted vs
 // actual delay at its next stop - see main.py's stop_predictions_once, which
-// predicts every vehicle's next stop). Same colours as the delay scale, so
-// green still means "good" and red "bad".
+// predicts every vehicle's next stop). Since 2026-09-27 anchored to the MBTA
+// (Boston transit authority) arrival-prediction standard instead of fixed
+// 30 s / 1 min lines: "accurate" = inside a window that widens with how far
+// ahead the prediction was made (+-1 min under 3 min ahead - most of ours),
+// decided by the delay service (main.py's ACCURACY_WINDOWS). The old yellow
+// "30s-1 min off" band painted ~19% of vehicles as a warning although they
+// were accurate by that standard.
 const ACCURACY_COLOR_BUCKETS = [
-    { max: 30, color: "#27ae60", label: "Within 30s" },
-    { max: 60, color: "#f1c40f", label: "30s-1 min off" },
-    { max: 120, color: "#e67e22", label: "1-2 min off" },
-    { max: Infinity, color: "#e74c3c", label: "2+ min off" },
+    { color: "#27ae60", label: "Within 30s" },
+    { color: "#a4d65e", label: "Accurate (standard)" },
+    { color: "#e67e22", label: "Off, under 2 min" },
+    { color: "#e74c3c", label: "Off by 2+ min" },
 ];
 
-function accuracyColor(errorSeconds) {
-    if (errorSeconds == null) {
+function accuracyColor(confirmed) {
+    if (confirmed?.predictionErrorSeconds == null) {
         return NO_DELAY_DATA_COLOR;
     }
-    return ACCURACY_COLOR_BUCKETS.find((b) => Math.abs(errorSeconds) < b.max).color;
+    const error = Math.abs(confirmed.predictionErrorSeconds);
+    const [spotOn, accurate, off, farOff] = ACCURACY_COLOR_BUCKETS;
+    if (error < 30) return spotOn.color;
+    if (confirmed.predictionAccurate) return accurate.color;
+    return (error < 120 ? off : farOff).color;
 }
 
 // "delay" or "accuracy". Remembered per browser; storage can be unavailable
@@ -112,7 +121,7 @@ function markerStyleFor(vehicle) {
     const confirmed = currentDelaysByTrip.get(tripKey(vehicle.serviceDate, vehicle.tripId));
     const fresh = confirmed && confirmed.minutesAgo <= (confirmed.staleAfterMinutes ?? MAX_DELAY_AGE_MINUTES);
     const color = colorMode === "accuracy"
-        ? accuracyColor(fresh ? confirmed.predictionErrorSeconds : null)
+        ? accuracyColor(fresh ? confirmed : null)
         : delayColor(fresh ? confirmed.delaySeconds : null);
     return { color, fillOpacity: IN_SERVICE_FILL_OPACITY };
 }
@@ -491,7 +500,8 @@ function renderLegend() {
     const tab = (mode, label) =>
         `<button type="button" data-mode="${mode}" class="legend-tab${colorMode === mode ? " active" : ""}">${label}</button>`;
     el.innerHTML = `<div class="legend-tabs">${tab("delay", "Delay")}${tab("accuracy", "Accuracy")}</div>`
-        + (accuracy ? `<div class="legend-note">Our last prediction vs reality</div>` : "")
+        + (accuracy ? `<div class="legend-note">Our last prediction vs reality<br>`
+            + `<small>Accurate = MBTA standard: &plusmn;1 min when<br>predicted under 3 min ahead</small></div>` : "")
         + `${rows}${swatch(NO_DELAY_DATA_COLOR)}${noData}<br>${swatch(OUT_OF_SERVICE_COLOR)}Out of service`;
     el.classList.remove("hidden");
 }
@@ -529,13 +539,16 @@ function scoreboardHtml(scoreboard) {
             + "each vehicle's next stop is graded when it gets there, so this fills within minutes.";
     }
     const mae = Math.round(scoreboard.meanAbsoluteErrorSeconds);
-    const within = Math.round(100 * scoreboard.within60sShare);
+    const accurate = Math.round(100 * scoreboard.accurateShare);
+    const persistenceAccurate = Math.round(100 * scoreboard.persistenceAccurateShare);
     const persistence = Math.round(scoreboard.persistenceMaeSeconds);
     const since = new Date(scoreboard.since).toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit" });
     let html = "<strong>Live model accuracy</strong><br>"
-        + `Avg error: <strong>${mae}s</strong> &middot; ${within}% within 1 min<br>`
+        + `Avg error: <strong>${mae}s</strong> &middot; <strong>${accurate}%</strong> accurate<br>`
         + `<span title="Error of just assuming the delay at the previous stop stays the same">`
-        + `Without the model: ${persistence}s</span><br>`
+        + `Without the model: ${persistence}s &middot; ${persistenceAccurate}% accurate</span><br>`
+        + `<small title="MBTA (Boston) arrival-prediction standard: within 1 min when predicted under 3 min ahead, wider further out">`
+        + `Accurate = MBTA standard</small><br>`
         + `<small>${scoreboard.gradedCount.toLocaleString()} next-stop predictions graded since ${since}</small>`;
     const groups = scoreboard.byVehicleType.filter((g) => g.gradedCount >= SCOREBOARD_MIN_GROUP);
     if (groups.length > 1) {

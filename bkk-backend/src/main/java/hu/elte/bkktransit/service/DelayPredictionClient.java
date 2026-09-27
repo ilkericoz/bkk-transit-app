@@ -117,6 +117,8 @@ public class DelayPredictionClient {
             @JsonProperty("mean_absolute_error_seconds") Double meanAbsoluteErrorSeconds,
             @JsonProperty("within_60s_share") Double within60sShare,
             @JsonProperty("persistence_mae_seconds") Double persistenceMaeSeconds,
+            @JsonProperty("accurate_share") Double accurateShare,
+            @JsonProperty("persistence_accurate_share") Double persistenceAccurateShare,
             @JsonProperty("by_vehicle_type") List<UpstreamScoreboardGroup> byVehicleType
     ) {
     }
@@ -149,7 +151,7 @@ public class DelayPredictionClient {
                 .toList();
         return new PredictionScoreboard(response.modelVersion(), response.since(), response.gradedCount(),
                 response.meanAbsoluteErrorSeconds(), response.within60sShare(), response.persistenceMaeSeconds(),
-                groups);
+                response.accurateShare(), response.persistenceAccurateShare(), groups);
     }
 
     private record UpstreamCurrentDelaysRequest(
@@ -167,7 +169,8 @@ public class DelayPredictionClient {
             @JsonProperty("stop_id") String stopId,
             @JsonProperty("graded_stop_id") String gradedStopId,
             @JsonProperty("graded_predicted_seconds") Double gradedPredictedSeconds,
-            @JsonProperty("graded_actual_seconds") Double gradedActualSeconds
+            @JsonProperty("graded_actual_seconds") Double gradedActualSeconds,
+            @JsonProperty("prediction_accurate") Boolean predictionAccurate
     ) {
     }
 
@@ -197,6 +200,6 @@ public class DelayPredictionClient {
                                 e.getValue().staleAfterMinutes(), e.getValue().predictionErrorSeconds(),
                                 e.getValue().predictionGradedMinutesAgo(), e.getValue().stopId(),
                                 e.getValue().gradedStopId(), e.getValue().gradedPredictedSeconds(),
-                                e.getValue().gradedActualSeconds())));
+                                e.getValue().gradedActualSeconds(), e.getValue().predictionAccurate())));
     }
 }

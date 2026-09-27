@@ -11,7 +11,9 @@ import java.util.List;
  *
  * persistenceMaeSeconds is the "no model" yardstick on the same
  * predictions - the error of just assuming the delay at the previous stop
- * stays the same.
+ * stays the same. accurateShare / persistenceAccurateShare: share of
+ * predictions within the MBTA arrival-prediction standard (main.py's
+ * ACCURACY_WINDOWS), for the model and for that yardstick.
  *
  * Until 2026-09-26 this was built from clicked/randomly sampled
  * predictions of every model since the start (now main.py's
@@ -25,6 +27,8 @@ public record PredictionScoreboard(
         Double meanAbsoluteErrorSeconds,
         Double within60sShare,
         Double persistenceMaeSeconds,
+        Double accurateShare,
+        Double persistenceAccurateShare,
         List<Group> byVehicleType
 ) {
 
