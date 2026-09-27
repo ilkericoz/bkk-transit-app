@@ -788,6 +788,35 @@ def sampled_scoreboard() -> SampledScoreboard:
     )
 
 
+# When a prediction counts as "accurate" (added 2026-09-27): the MBTA's
+# (Boston transit authority) published arrival-prediction standard,
+# https://www.mbta.com/performance-metrics/arrival-prediction-accuracy -
+# a window that widens with how far ahead the prediction was made. Rows:
+# (horizon below, minutes; seconds EARLY allowed; seconds LATE allowed),
+# early = the vehicle arrived before the predicted time. MBTA stops at 30
+# min ahead; longer horizons (~0.5% of every-stop predictions) use the last
+# window. A fixed 30 s / 1 min line ignored the horizon and painted ~19% of
+# vehicles yellow that are accurate by this standard.
+ACCURACY_WINDOWS = [(3, 60, 60), (6, 90, 120), (12, 150, 210), (30, 240, 360)]
+
+
+def prediction_accurate(predicted_delay: float, actual_delay: float, horizon_seconds: float) -> bool:
+    """True when the actual arrival fell inside the ACCURACY_WINDOWS window
+    for a prediction made horizon_seconds before it."""
+    early, late = next(((e, l) for below, e, l in ACCURACY_WINDOWS if horizon_seconds < below * 60),
+                       ACCURACY_WINDOWS[-1][1:])
+    return -early <= actual_delay - predicted_delay <= late
+
+
+def accurate_sql(predicted: str, actual: str, horizon_seconds: str) -> str:
+    """The same test as prediction_accurate, as a SQL boolean expression."""
+    def bound(i: int) -> str:
+        cases = " ".join(f"WHEN {horizon_seconds} < {below * 60} THEN {w[i]}"
+                         for below, *w in ACCURACY_WINDOWS)
+        return f"(CASE {cases} ELSE {ACCURACY_WINDOWS[-1][i + 1]} END)"
+    return f"(({actual}) - ({predicted}) BETWEEN -{bound(0)} AND {bound(1)})"
+
+
 class ScoreboardGroup(BaseModel):
     vehicle_route_type: str
     graded_count: int
@@ -805,6 +834,9 @@ class Scoreboard(BaseModel):
     # Carrying the delay at the previous stop forward unchanged, scored on
     # the same predictions - the "no model" yardstick for the number above.
     persistence_mae_seconds: float | None
+    # Share accurate by ACCURACY_WINDOWS, for the model and for "no model".
+    accurate_share: float | None
+    persistence_accurate_share: float | None
     by_vehicle_type: list[ScoreboardGroup]
 
 
@@ -814,12 +846,15 @@ class Scoreboard(BaseModel):
 SCOREBOARD_CACHE_SECONDS = 60
 _scoreboard_cache: tuple[float, Scoreboard] | None = None
 
+_HORIZON = "extract(epoch FROM actual_recorded_at - reference_time)"
 SCOREBOARD_QUERY = f"""
     SELECT GROUPING(vehicle_route_type) = 1 AS is_total, coalesce(vehicle_route_type, 'UNKNOWN'), count(*),
            avg(abs(predicted_delay_seconds - actual_delay_seconds)),
            avg((abs(predicted_delay_seconds - actual_delay_seconds) <= 60)::int)::float8,
            avg(abs(upstream_delay_seconds - actual_delay_seconds)),
-           min(predicted_at)
+           min(predicted_at),
+           avg({accurate_sql("predicted_delay_seconds", "actual_delay_seconds", _HORIZON)}::int)::float8,
+           avg({accurate_sql("upstream_delay_seconds", "actual_delay_seconds", _HORIZON)}::int)::float8
     FROM stop_predictions
     WHERE model_version = %(model_version)s AND actual_delay_seconds IS NOT NULL
       AND abs(actual_delay_seconds) <= %(max_abs_delay)s
@@ -858,7 +893,7 @@ def scoreboard() -> Scoreboard:
     total = next((r[1:] for r in rows if r[0]), None)
     groups = [ScoreboardGroup(vehicle_route_type=vtype, graded_count=n, mean_absolute_error_seconds=mae,
                               within_60s_share=within, persistence_mae_seconds=persist)
-              for is_total, vtype, n, mae, within, persist, _since in rows if not is_total]
+              for is_total, vtype, n, mae, within, persist, _since, _acc, _pacc in rows if not is_total]
     result = Scoreboard(
         model_version=model_version,
         since=total[5] if total else None,
@@ -866,6 +901,8 @@ def scoreboard() -> Scoreboard:
         mean_absolute_error_seconds=total[2] if total else None,
         within_60s_share=total[3] if total else None,
         persistence_mae_seconds=total[4] if total else None,
+        accurate_share=total[6] if total else None,
+        persistence_accurate_share=total[7] if total else None,
         by_vehicle_type=sorted(groups, key=lambda g: g.graded_count, reverse=True),
     )
     _scoreboard_cache = (time.time(), result)
@@ -920,6 +957,8 @@ class CurrentDelayReading(BaseModel):
     # no prediction for this trip has been graded yet.
     prediction_error_seconds: float | None = None
     prediction_graded_minutes_ago: float | None = None
+    # Whether that prediction was accurate by ACCURACY_WINDOWS (added 2026-09-27).
+    prediction_accurate: bool | None = None
     # For the popup (added 2026-09-25), so every number can be shown next to
     # the stop it belongs to: the stop the delay above was confirmed at, and
     # the graded prediction's stop, predicted and actual delay.
@@ -993,7 +1032,8 @@ def vehicles_current_delays(request: CurrentDelaysRequest) -> CurrentDelaysRespo
         rows = cur.fetchall()
         cur.execute("""
             SELECT DISTINCT ON (trip_id) trip_id, predicted_delay_seconds - actual_delay_seconds, actual_recorded_at,
-                   stop_id, predicted_delay_seconds, actual_delay_seconds
+                   stop_id, predicted_delay_seconds, actual_delay_seconds,
+                   extract(epoch FROM actual_recorded_at - reference_time)
             FROM stop_predictions
             WHERE trip_id = ANY(%(trip_ids)s) AND service_date = %(service_date)s AND actual_recorded_at IS NOT NULL
             ORDER BY trip_id, actual_recorded_at DESC
@@ -1031,12 +1071,13 @@ def vehicles_current_delays(request: CurrentDelaysRequest) -> CurrentDelaysRespo
         static_stop = schedule_lookup.stop_id_at(gtfs_trip_id, stop_sequence)
         delays[trip_id].stop_id = f"BKK_{static_stop}" if static_stop else None
         if trip_id in last_graded:
-            error, graded_at, graded_stop, predicted, actual = last_graded[trip_id]
+            error, graded_at, graded_stop, predicted, actual, horizon = last_graded[trip_id]
             delays[trip_id].prediction_error_seconds = error
             delays[trip_id].prediction_graded_minutes_ago = (now - graded_at.astimezone(BUDAPEST_TZ)).total_seconds() / 60
             delays[trip_id].graded_stop_id = graded_stop
             delays[trip_id].graded_predicted_seconds = predicted
             delays[trip_id].graded_actual_seconds = actual
+            delays[trip_id].prediction_accurate = prediction_accurate(predicted, actual, float(horizon))
     return CurrentDelaysResponse(delays=delays)
 
 
