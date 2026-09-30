@@ -1,6 +1,6 @@
 """
 Daily BKK timetable (static GTFS) update, added 2026-09-25 - run by a
-Windows scheduled task at 04:30 (see README), or by hand.
+Windows scheduled task at 04:30 (see ENGINEERING_NOTES.md), or by hand.
 
 Why: BKK publishes timetable updates every few days, and the live feed
 follows the newest one. Our copy went stale silently once: within two weeks
