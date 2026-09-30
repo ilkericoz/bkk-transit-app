@@ -162,6 +162,15 @@ STOP_PREDICTIONS_DDL = """
     -- Added 2026-09-25 with the recent-traffic feature (nullable, additive).
     ALTER TABLE stop_predictions ADD COLUMN IF NOT EXISTS has_segment_recent INTEGER;
     ALTER TABLE stop_predictions ADD COLUMN IF NOT EXISTS segment_recent_gain_seconds DOUBLE PRECISION;
+    -- Added 2026-09-30: the remaining model inputs, so any live prediction can
+    -- be replayed exactly from its row (nullable, additive; older rows stay NULL).
+    ALTER TABLE stop_predictions ADD COLUMN IF NOT EXISTS minutes_since_ahead DOUBLE PRECISION;
+    ALTER TABLE stop_predictions ADD COLUMN IF NOT EXISTS scheduled_gap_minutes DOUBLE PRECISION;
+    ALTER TABLE stop_predictions ADD COLUMN IF NOT EXISTS segment_recent_count INTEGER;
+    ALTER TABLE stop_predictions ADD COLUMN IF NOT EXISTS temperature_2m DOUBLE PRECISION;
+    ALTER TABLE stop_predictions ADD COLUMN IF NOT EXISTS precipitation DOUBLE PRECISION;
+    ALTER TABLE stop_predictions ADD COLUMN IF NOT EXISTS wind_speed_10m DOUBLE PRECISION;
+    ALTER TABLE stop_predictions ADD COLUMN IF NOT EXISTS deviated INTEGER;
     CREATE INDEX IF NOT EXISTS idx_stop_predictions_ungraded
         ON stop_predictions (reference_time) WHERE actual_recorded_at IS NULL;
 """
@@ -1435,12 +1444,16 @@ def stop_predictions_once() -> dict:
                 INSERT INTO stop_predictions (trip_id, route_id, vehicle_route_type, stop_id, stop_sequence,
                     service_date, reference_time, predicted_delay_seconds, upstream_delay_seconds,
                     has_vehicle_ahead, ahead_delay_seconds, model_version,
-                    has_segment_recent, segment_recent_gain_seconds)
+                    has_segment_recent, segment_recent_gain_seconds,
+                    minutes_since_ahead, scheduled_gap_minutes, segment_recent_count,
+                    temperature_2m, precipitation, wind_speed_10m, deviated)
                 VALUES %s ON CONFLICT (trip_id, service_date, stop_sequence) DO NOTHING
             """, [(r["trip_id"], r["route_id"], r["vehicle_route_type"], r["stop_id"], r["stop_sequence"],
                    r["service_date"], r["reference_time"], float(p), r["upstream_delay_seconds"],
                    r["has_vehicle_ahead"], r["ahead_delay_seconds"], model_version,
-                   r["has_segment_recent"], r["segment_recent_gain_seconds"])
+                   r["has_segment_recent"], r["segment_recent_gain_seconds"],
+                   r["minutes_since_ahead"], r["scheduled_gap_minutes"], r["segment_recent_count"],
+                   r["temperature_2m"], r["precipitation"], r["wind_speed_10m"], r["deviated"])
                   for r, p in zip(rows, predicted)])
             conn.commit()
             predicted_count = len(rows)
