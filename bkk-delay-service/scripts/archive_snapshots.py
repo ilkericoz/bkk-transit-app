@@ -17,9 +17,10 @@ of id, sum of id^2, non-null count of every column and sums of the numeric
 columns. Matching days go to manifest.jsonl with that fingerprint, which is
 what a later delete must check against.
 
-Read-only on the database. Usage (from bkk-delay-service/, host venv):
+Export and --verify are read-only on the database. Usage (from bkk-delay-service/, host venv):
     python scripts/archive_snapshots.py --before 2026-09-27   # export / resume
     python scripts/archive_snapshots.py --verify               # re-check all files vs DB
+    python scripts/archive_snapshots.py --delete [--max-days N] # delete archived days from DB
 """
 
 import argparse
@@ -60,6 +61,10 @@ SELECT_COLUMNS = ", ".join(
     for f in SCHEMA)
 INT_SUM_COLUMNS = ["last_update_time", "stop_distance_percent", "stop_sequence"]
 FLOAT_SUM_COLUMNS = ["bearing", "lat", "lon"]
+FINGERPRINT_KEYS = (["rows", "id_sum", "id_sq_sum", "id_min", "id_max"]
+                    + [f"nonnull_{f.name}" for f in SCHEMA]
+                    + [f"sum_{c}" for c in INT_SUM_COLUMNS + FLOAT_SUM_COLUMNS]
+                    + ["count_deviated", "count_stale"])
 
 LIVE_LAG_QUERY = """
     SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch FROM recorded_at) - last_update_time)
@@ -235,14 +240,65 @@ def verify() -> None:
     print(f"verify finished, {bad} mismatching day(s)", flush=True)
 
 
+def delete(max_days: int | None = None) -> None:
+    """Delete archived days from Postgres, one transaction per day.
+
+    A day is deleted only when its file and the DB both still match the
+    manifest fingerprint, and committed only when DELETE removed exactly the
+    manifest's row count; anything else rolls back and stops. Deleted days are
+    logged to deleted.jsonl and skipped on a rerun.
+    """
+    deleted_path = ARCHIVE_DIR / "deleted.jsonl"
+    already = set()
+    if deleted_path.exists():
+        already = {json.loads(line)["day"] for line in deleted_path.read_text().splitlines() if line.strip()}
+    conn = psycopg2.connect(**DB_CONFIG)
+    try:
+        todo = [(d, e) for d, e in sorted(read_manifest().items()) if d not in already]
+        for day_str, entry in todo[:max_days]:
+            t0 = time.time()
+            file_problems = compare({k: entry[k] for k in FINGERPRINT_KEYS},
+                                    file_fingerprint(ARCHIVE_DIR / entry["file"]))
+            if file_problems:
+                raise RuntimeError(f"{day_str}: archive file no longer matches manifest: {file_problems}")
+            with conn.cursor() as cur:
+                wait_for_collector(cur)
+                conn.commit()
+                db_fp = db_fingerprint(cur, date.fromisoformat(day_str))
+                db_problems = compare({k: entry[k] for k in FINGERPRINT_KEYS}, db_fp)
+                if db_problems:
+                    conn.rollback()
+                    raise RuntimeError(f"{day_str}: DB no longer matches manifest: {db_problems}")
+                cur.execute("DELETE FROM vehicle_position_snapshots "
+                            "WHERE recorded_at >= %s AND recorded_at < %s",
+                            (entry["range_start"], entry["range_end"]))
+                if cur.rowcount != entry["rows"]:
+                    conn.rollback()
+                    raise RuntimeError(f"{day_str}: DELETE matched {cur.rowcount} rows, "
+                                       f"manifest has {entry['rows']} - rolled back")
+            conn.commit()
+            with open(deleted_path, "a") as d:
+                d.write(json.dumps({"day": day_str, "rows": entry["rows"],
+                                    "deleted_at": datetime.now(BUDAPEST).isoformat(timespec="seconds")}) + "\n")
+            print(f"{day_str}: deleted {entry['rows']:,} rows (matched manifest), {time.time() - t0:.0f} s", flush=True)
+    finally:
+        conn.close()
+    print("delete finished", flush=True)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--before", type=date.fromisoformat,
                         help="archive Budapest days strictly before this date")
     parser.add_argument("--verify", action="store_true")
+    parser.add_argument("--delete", action="store_true",
+                        help="delete archived days from Postgres (each checked against the manifest)")
+    parser.add_argument("--max-days", type=int, help="with --delete: stop after this many days")
     args = parser.parse_args()
     if args.verify:
         verify()
+    elif args.delete:
+        delete(args.max_days)
     elif args.before:
         export(args.before)
     else:
