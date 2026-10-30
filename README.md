@@ -65,12 +65,14 @@ docker compose up --build -d
 
 Postgres runs natively, not in Compose (the header comment in `docker-compose.yml` explains why).
 
+Run the backend's tests with `cd bkk-backend && mvn test`. Apart from one Spring context check, they need no database, broker or network: the repositories and clients are mocked, and the prediction-service client is tested against a small local stub server.
+
 ## Known limitations
 
 - Only data since late August 2026: no winter, no holidays yet.
 - A trip's first observed stop (cold start) and departures from a first stop are the weakest cases; buses are less accurate than trams.
 - Predictions several minutes ahead are much less accurate than the next stop. The longer-range predictions are not shown on the map yet.
-- No automated test suite yet.
+- Automated tests cover the backend only (`cd bkk-backend && mvn test`, 25 JUnit tests); the Python prediction service has none yet.
 
 ## Data & license
 
