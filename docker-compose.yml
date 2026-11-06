@@ -22,10 +22,20 @@
 # disposable (messages are ack'd and drained within seconds), so there's
 # nothing worth migrating out of it.
 
+# Added 2026-11-06: cap every container's log (json-file driver keeps it
+# forever by default). bkk-backend's log had silently reached 210 GB from
+# Hibernate's show-sql printing every INSERT - 3 x 20 MB is plenty to debug with.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "3"
+
 services:
   rabbitmq:
     image: rabbitmq:4-management
     container_name: bkk-rabbitmq
+    logging: *default-logging
     restart: unless-stopped
     ports:
       - "5672:5672"
@@ -36,6 +46,7 @@ services:
   delay-service:
     build: ./bkk-delay-service
     container_name: bkk-delay-service
+    logging: *default-logging
     restart: unless-stopped
     ports:
       - "8000:8000"
@@ -96,6 +107,7 @@ services:
   backend:
     build: ./bkk-backend
     container_name: bkk-backend
+    logging: *default-logging
     restart: unless-stopped
     ports:
       - "8080:8080"
@@ -121,6 +133,10 @@ services:
       DELAY_SERVICE_URL: http://delay-service:8000
       BKK_GTFS_STOPS_FILE: /gtfs-data/stops.txt
       BKK_GTFS_ROUTES_FILE: /gtfs-data/routes.txt
+      # Belt and braces with application.properties (2026-11-06): keeps SQL
+      # logging off even on an image built from an older jar.
+      SPRING_JPA_SHOW_SQL: "false"
+      SPRING_JPA_PROPERTIES_HIBERNATE_FORMAT_SQL: "false"
     extra_hosts:
       # host.docker.internal resolves automatically on Docker Desktop
       # (Windows/Mac) already - this makes it also work if the project is
