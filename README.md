@@ -2,7 +2,9 @@
 
 A real-time public transit tracker and machine-learning delay predictor for Budapest (BKK), built on BKK's own open real-time and static data. It shows live vehicle positions on a map, predicts how late each vehicle will be at its next stops, and grades every prediction against reality when the vehicle arrives.
 
-Java (Spring Boot) backend, Python ML service, RabbitMQ ingestion pipeline, PostgreSQL, Docker Compose. Collecting data since 26 August 2026 (over 210 million vehicle position records). A live demo is available on request; it runs on my own machine, so there is no permanent public link.
+Java (Spring Boot) backend, Python ML service, RabbitMQ ingestion pipeline, PostgreSQL, Docker Compose. Collecting data since 26 August 2026 (over 210 million vehicle position records).
+
+**Live demo: https://130-61-212-216.sslip.io** (a copy running on Oracle Cloud with the last 7 days of data; setup in [`deploy/`](deploy/)).
 
 ## What it does
 
