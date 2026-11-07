@@ -30,7 +30,7 @@ services:
       POSTGRES_DB: bkk_transit
       POSTGRES_USER: bkk_app
       POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
-    command: ["postgres", "-c", "shared_buffers=2GB", "-c", "effective_cache_size=8GB",
+    command: ["postgres", "-c", "shared_buffers=2GB", "-c", "effective_cache_size=4GB",
               "-c", "work_mem=32MB", "-c", "max_wal_size=4GB"]
     volumes:
       - pg-data:/var/lib/postgresql/data

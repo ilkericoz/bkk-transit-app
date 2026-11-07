@@ -1,8 +1,8 @@
 """Keep asking Oracle Cloud for a free Ampere A1 VM until capacity frees up.
 
 Free ARM capacity is often "out of capacity" in every availability domain;
-it frees up at random times. This tries each AD every few minutes, prefers
-4 OCPU / 24 GB, falls back to 2 OCPU / 12 GB, and stops at the first success.
+it frees up at random times. This tries each AD every few minutes,
+asks for 2 OCPU / 12 GB (the free limit) and stops at the first success.
 
 Uses ~/.oci/config (API key). Creates the network (VCN, internet gateway,
 public subnet, ports 22/80/443) on the first run if it doesn't exist yet.
@@ -17,7 +17,7 @@ import oci
 
 NAME = "bkk-transit"
 SHAPE = "VM.Standard.A1.Flex"
-SIZES = [(4, 24), (2, 12)]          # (OCPUs, GB), preferred first
+SIZES = [(2, 12)]                    # (OCPUs, GB): the Always Free A1 limit since mid-2026
 BOOT_GB = 150
 ROUND_PAUSE_S = 120                  # between rounds (Oracle rate-limits launch calls)
 SSH_KEY = os.path.expanduser("~/.ssh/id_rsa.pub")
