@@ -6,3 +6,4 @@ db-backups/
 
 # cloud deployment secrets
 deploy/.env
+deploy/oracle-retry.log
