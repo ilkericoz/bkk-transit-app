@@ -1,0 +1,33 @@
+# Caddy gets and renews the HTTPS certificate for $DOMAIN automatically.
+{$DOMAIN} {
+	encode gzip
+
+	# The public site is read-only: the map only GETs, plus two POST
+	# endpoints that compute predictions without storing anything user-supplied.
+	@allowed {
+		method GET HEAD
+	}
+	@allowed_post {
+		method POST
+		path /api/vehicles/delay-prediction /api/vehicles/current-delays
+	}
+	handle @allowed {
+		reverse_proxy backend:8080
+	}
+	handle @allowed_post {
+		request_body {
+			max_size 64KB
+		}
+		reverse_proxy backend:8080
+	}
+	handle {
+		respond "Method not allowed" 405
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+}

@@ -1,0 +1,137 @@
+# Public cloud deployment (Oracle Cloud Always Free, ARM Ubuntu VM), added 2026-11-07.
+# Separate from the root docker-compose.yml, which stays the home setup.
+#
+# Differences from home:
+#   - Postgres runs in a container here (fresh database, live data only);
+#     the full history stays on the home machine for training/thesis.
+#   - Only Caddy is reachable from the internet (ports 80/443, automatic HTTPS
+#     via Let's Encrypt). Postgres, RabbitMQ, the backend and the delay service
+#     have no published ports: they talk over the internal Docker network.
+#   - A retention job keeps the database to the last RETENTION_DAYS days.
+#
+# Run from this folder:  docker compose -f docker-compose.cloud.yml up -d --build
+# Needs a .env next to this file (see .env.example) and, copied from home:
+#   ../bkk-backend/target/bkk-backend-*.jar, ../bkk-backend/gtfs-data/raw/,
+#   ../bkk-backend/gtfs-data/retired_stop_times.csv.gz, ../bkk-delay-service/models/
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "3"
+
+services:
+  postgres:
+    image: postgres:17
+    container_name: bkk-postgres
+    logging: *default-logging
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: bkk_transit
+      POSTGRES_USER: bkk_app
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
+    command: ["postgres", "-c", "shared_buffers=2GB", "-c", "effective_cache_size=8GB",
+              "-c", "work_mem=32MB", "-c", "max_wal_size=4GB"]
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bkk_app -d bkk_transit"]
+      interval: 5s
+      retries: 20
+
+  rabbitmq:
+    image: rabbitmq:4-management
+    container_name: bkk-rabbitmq
+    logging: *default-logging
+    restart: unless-stopped
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+
+  delay-service:
+    build: ../bkk-delay-service
+    container_name: bkk-delay-service
+    logging: *default-logging
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ../bkk-backend/gtfs-data:/gtfs-root:ro
+      - ../bkk-delay-service/models:/app/models:ro
+    environment:
+      GTFS_DATA_DIR: /gtfs-root/raw
+      DB_HOST: postgres
+      DB_PASSWORD: ${DB_PASSWORD}
+      BKK_API_KEY: ${BKK_API_KEY}
+      AUTO_SAMPLE_ENABLED: "1"
+      AUTO_SAMPLE_INTERVAL_SECONDS: "300"
+      AUTO_SAMPLE_SIZE: "50"
+      STOP_PREDICTIONS_ENABLED: "1"
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      NUMEXPR_NUM_THREADS: "1"
+
+  backend:
+    build: ../bkk-backend
+    container_name: bkk-backend
+    logging: *default-logging
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_started
+      delay-service:
+        condition: service_started
+    volumes:
+      - ../bkk-backend/gtfs-data/raw:/gtfs-data:ro
+    environment:
+      DB_PASSWORD: ${DB_PASSWORD}
+      BKK_API_KEY: ${BKK_API_KEY:?set BKK_API_KEY in .env}
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/bkk_transit
+      SPRING_RABBITMQ_HOST: rabbitmq
+      DELAY_SERVICE_URL: http://delay-service:8000
+      BKK_GTFS_STOPS_FILE: /gtfs-data/stops.txt
+      BKK_GTFS_ROUTES_FILE: /gtfs-data/routes.txt
+      SPRING_JPA_SHOW_SQL: "false"
+      JAVA_TOOL_OPTIONS: "-Xmx2g"
+
+  caddy:
+    image: caddy:2
+    container_name: bkk-caddy
+    logging: *default-logging
+    restart: unless-stopped
+    depends_on: [backend]
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN in .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+  # Once a day: drop raw positions older than RETENTION_DAYS (they are the bulk
+  # of the data, ~5.5M rows/day) and graded predictions older than 30 days.
+  retention:
+    image: postgres:17
+    container_name: bkk-retention
+    logging: *default-logging
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: ${DB_PASSWORD}
+      RETENTION_DAYS: ${RETENTION_DAYS:-7}
+    volumes:
+      - ./retention.sql:/retention.sql:ro
+    entrypoint: ["sh", "-c", "while true; do sleep 3600; psql -h postgres -U bkk_app -d bkk_transit -v days=$$RETENTION_DAYS -f /retention.sql; sleep 82800; done"]
+
+volumes:
+  pg-data:
+  rabbitmq-data:
+  caddy-data:
+  caddy-config:

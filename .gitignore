@@ -3,3 +3,6 @@
 
 hs_err_pid*.log
 db-backups/
+
+# cloud deployment secrets
+deploy/.env
